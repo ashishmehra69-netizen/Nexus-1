@@ -1,0 +1,2974 @@
+# NEXUS Learning Generator (Domain-Agnostic) - Part 1
+# Last Updated: 2026-01-02
+# Syntax: Enhanced with Universal Domain Support
+
+import gradio as gr
+from groq import Groq
+from datetime import datetime
+from datetime import timedelta
+import os
+import time
+import random
+import string
+import json
+from pathlib import Path
+import re
+from typing import Dict, List, Tuple
+from urllib.parse import urlparse
+
+# Validate imports
+assert gr is not None, "Gradio import failed"
+assert Groq is not None, "Groq import failed"
+
+groq_key = os.environ.get('GROQ_API_KEY') or os.environ.get('HF_TOKEN')
+if groq_key: 
+    os.environ['GROQ_API_KEY'] = groq_key
+
+groq_key_2 = os.environ.get('GROQ_API_KEY_2')
+groq_key_3 = os.environ.get('GROQ_API_KEY_3')
+groq_key_4 = os.environ.get('GROQ_API_KEY_4')
+
+DATA_DIR = Path("data")
+DATA_DIR.mkdir(exist_ok=True)
+STATE_FILE = DATA_DIR / "state.json"
+ANALYTICS_FILE = DATA_DIR / "analytics.json"
+
+payment_state = {}
+analytics = {
+    'total_visits': 0,
+    'total_generations': 0,
+    'total_unlocks': 0,
+    'topics_generated': {},
+    'daily_stats': {}
+}
+
+def save_state():
+    try:
+        with open(STATE_FILE, 'w') as f:
+            json.dump(payment_state, f, indent=2)
+        print(f"State saved: {len(payment_state)} sessions")
+    except Exception as e:
+        print(f"Save failed: {e}")
+
+def load_state():
+    global payment_state
+    try:
+        if STATE_FILE.exists():
+            with open(STATE_FILE, 'r') as f:
+                payment_state = json.load(f)
+            print(f"State loaded: {len(payment_state)} sessions")
+        else:
+            payment_state = {}
+    except Exception as e:
+        print(f"Load failed: {e}")
+        payment_state = {}
+
+def load_analytics():
+    global analytics
+    try:
+        if ANALYTICS_FILE.exists():
+            with open(ANALYTICS_FILE, 'r') as f:
+                analytics = json.load(f)
+            print(f"Analytics loaded: {analytics['total_generations']} generations")
+        else:
+            analytics = {
+                'total_visits': 0,
+                'total_generations': 0,
+                'total_unlocks': 0,
+                'topics_generated': {},
+                'daily_stats': {}
+            }
+    except Exception as e:
+        print(f"Analytics load failed: {e}")
+
+def save_analytics():
+    try:
+        with open(ANALYTICS_FILE, 'w') as f:
+            json.dump(analytics, f, indent=2)
+    except Exception as e:
+        print(f"Analytics save failed: {e}")
+
+def track_generation(topic, fmt, aud_lvl):
+    """Track when content is generated"""
+    today = datetime.now().strftime('%Y-%m-%d')
+    
+    analytics['total_generations'] += 1
+    
+    if topic not in analytics['topics_generated']:
+        analytics['topics_generated'][topic] = 0
+    analytics['topics_generated'][topic] += 1
+    
+    if today not in analytics['daily_stats']:
+        analytics['daily_stats'][today] = {
+            'generations': 0,
+            'unlocks': 0,
+            'topics': []
+        }
+    analytics['daily_stats'][today]['generations'] += 1
+    analytics['daily_stats'][today]['topics'].append({
+        'topic': topic,
+        'format': fmt,
+        'audience': aud_lvl,
+        'time': datetime.now().strftime('%H:%M:%S')
+    })
+    
+    save_analytics()
+
+def track_unlock():
+    """Track when content is unlocked"""
+    today = datetime.now().strftime('%Y-%m-%d')
+    
+    analytics['total_unlocks'] += 1
+    
+    if today not in analytics['daily_stats']:
+        analytics['daily_stats'][today] = {
+            'generations': 0,
+            'unlocks': 0,
+            'topics': []
+        }
+    analytics['daily_stats'][today]['unlocks'] += 1
+    
+    save_analytics()
+
+def get_analytics_summary():
+    """Get human-readable analytics summary"""
+    if analytics.get('total_generations', 0) == 0:
+        return "# 📊 No analytics data yet"
+    
+    try:
+        conversion_rate = (analytics['total_unlocks'] / max(analytics['total_generations'], 1) * 100)
+    except (KeyError, ZeroDivisionError):
+        conversion_rate = 0.0
+    
+    summary = f"""# 📊 NEXUS Analytics Dashboard
+
+**Total Statistics:**
+- Total Generations: {analytics.get('total_generations', 0)}
+- Total Unlocks: {analytics.get('total_unlocks', 0)}
+- Conversion Rate: {conversion_rate:.1f}%
+
+**Top 10 Topics:**
+"""
+    
+    topics_generated = analytics.get('topics_generated', {})
+    if topics_generated:
+        sorted_topics = sorted(topics_generated.items(), key=lambda x: x[1], reverse=True)[:10]
+        for i, (topic, count) in enumerate(sorted_topics, 1):
+            summary += f"{i}. {topic}: {count} generations\n"
+    else:
+        summary += "No topics generated yet\n"
+    
+    summary += "\n**Recent Activity (Last 7 Days):**\n"
+    
+    last_7_days = [(datetime.now() - timedelta(days=i)).strftime('%Y-%m-%d') for i in range(7)]
+    daily_stats = analytics.get('daily_stats', {})
+    
+    for day in reversed(last_7_days):
+        if day in daily_stats:
+            stats = daily_stats[day]
+            summary += f"- {day}: {stats.get('generations', 0)} generations, {stats.get('unlocks', 0)} unlocks\n"
+    
+    return summary
+
+def gen_session_id():
+    return ''.join(random.choices(string.ascii_letters + string.digits, k=16))
+
+
+# ===== DOMAIN DETECTION SYSTEM =====
+
+class DomainDetector:
+    """Automatically detect domain and find appropriate resources"""
+    
+    DOMAIN_PATTERNS = {
+        'medical': {
+            'keywords': ['medical', 'clinical', 'surgery', 'doctor', 'patient', 'diagnosis', 
+                        'treatment', 'healthcare', 'ophthalmology', 'cardiology', 'radiology',
+                        'nursing', 'pharmaceutical', 'medicine', 'hospital', 'anatomy', 
+                        'pathology', 'oncology', 'pediatrics', 'geriatrics'],
+            'sites': ['pubmed.ncbi.nlm.nih.gov', 'nejm.org', 'bmj.com', 'thelancet.com', 
+                     'aao.org', 'acc.org', 'medscape.com', 'aamc.org', 'who.int',
+                     'mayoclinic.org', 'nih.gov', 'cdc.gov'],
+            'search_terms': ['clinical guidelines', 'medical education', 'residency training', 
+                           'CME', 'evidence-based', 'patient care protocols']
+        },
+        'engineering': {
+            'keywords': ['engineering', 'technical', 'mechanical', 'electrical', 'civil',
+                        'structural', 'manufacturing', 'design', 'systems', 'robotics',
+                        'aerospace', 'chemical', 'industrial', 'materials'],
+            'sites': ['ieee.org', 'asme.org', 'engineeringvillage.com', 
+                     'thomasnet.com', 'engineeringnews.com', 'asce.org',
+                     'imeche.org', 'spe.org'],
+            'search_terms': ['technical standards', 'engineering principles', 'design guidelines',
+                           'certification', 'professional development', 'best practices']
+        },
+        'automotive': {
+            'keywords': ['automotive', 'car', 'vehicle', 'servicing', 'mechanic', 'repair',
+                        'maintenance', 'diagnostic', 'engine', 'transmission', 'brake',
+                        'suspension', 'auto', 'technician'],
+            'sites': ['ase.com', 'sae.org', 'motorage.com', 'automotivetechnician.org',
+                     'iatn.net', 'motor.com', 'aftermarketnews.com'],
+            'search_terms': ['service procedures', 'diagnostic training', 'repair techniques',
+                           'ASE certification', 'technician training', 'automotive repair']
+        },
+        'it_software': {
+            'keywords': ['software', 'programming', 'coding', 'development', 'IT', 'cybersecurity',
+                        'cloud', 'data', 'AI', 'machine learning', 'devops', 'database',
+                        'networking', 'web', 'mobile', 'app', 'algorithm', 'python', 'java'],
+            'sites': ['stackoverflow.com', 'github.com', 'medium.com', 'dev.to', 
+                     'coursera.org', 'udacity.com', 'pluralsight.com', 'aws.amazon.com',
+                     'docs.microsoft.com', 'developer.mozilla.org'],
+            'search_terms': ['tutorial', 'best practices', 'certification', 'developer guide',
+                           'technical documentation', 'coding standards']
+        },
+        'finance': {
+            'keywords': ['finance', 'accounting', 'investment', 'banking', 'trading',
+                        'financial', 'portfolio', 'risk', 'audit', 'tax', 'equity',
+                        'debt', 'valuation', 'merger', 'acquisition'],
+            'sites': ['investopedia.com', 'cfainstitute.org', 'aicpa.org',
+                     'wsj.com', 'ft.com', 'bloomberg.com', 'morningstar.com'],
+            'search_terms': ['financial analysis', 'professional certification', 'investment strategy',
+                           'accounting principles', 'financial planning', 'CFA']
+        },
+        'legal': {
+            'keywords': ['legal', 'law', 'attorney', 'lawyer', 'litigation', 'contract',
+                        'compliance', 'regulatory', 'jurisprudence', 'court', 'statute',
+                        'legislation', 'paralegal', 'advocacy'],
+            'sites': ['americanbar.org', 'law.com', 'lexisnexis.com', 'westlaw.com',
+                     'findlaw.com', 'justia.com', 'nolo.com'],
+            'search_terms': ['legal education', 'CLE', 'case law', 'legal practice',
+                           'bar preparation', 'legal research']
+        },
+        'education': {
+            'keywords': ['teaching', 'education', 'pedagogy', 'curriculum', 'learning',
+                        'classroom', 'instruction', 'academic', 'student', 'assessment',
+                        'literacy', 'school', 'university', 'professor'],
+            'sites': ['edutopia.org', 'teachthought.com', 'chronicle.com', 'insidehighered.com',
+                     'ascd.org', 'edweek.org', 'educause.edu'],
+            'search_terms': ['teaching methods', 'instructional design', 'educational research',
+                           'curriculum development', 'learning theory', 'pedagogy']
+        },
+        'manufacturing': {
+            'keywords': ['manufacturing', 'production', 'quality', 'lean', 'six sigma',
+                        'operations', 'supply chain', 'assembly', 'fabrication', 'process',
+                        'warehouse', 'inventory', 'logistics'],
+            'sites': ['sme.org', 'manufacturingusa.com', 'industryweek.com', 'asq.org',
+                     'apics.org', 'isixsigma.com', 'lean.org'],
+            'search_terms': ['manufacturing processes', 'quality control', 'lean training',
+                           'production optimization', 'industrial engineering', 'continuous improvement']
+        },
+        'sales_marketing': {
+            'keywords': ['sales', 'marketing', 'branding', 'advertising', 'customer',
+                        'digital marketing', 'social media', 'promotion', 'campaign',
+                        'lead generation', 'CRM', 'SEO', 'content marketing'],
+            'sites': ['hubspot.com', 'marketingprofs.com', 'adweek.com', 'nielsen.com',
+                     'salesforce.com', 'contentmarketinginstitute.com', 'moz.com'],
+            'search_terms': ['marketing strategy', 'sales training', 'customer engagement',
+                           'digital marketing', 'brand management', 'sales enablement']
+        },
+        'hospitality': {
+            'keywords': ['hospitality', 'hotel', 'restaurant', 'culinary', 'chef', 'food service',
+                        'tourism', 'guest', 'catering', 'front desk', 'housekeeping', 'travel',
+                        'resort', 'accommodation', 'booking', 'destination'],
+            'sites': ['ahla.com', 'hospitalitynet.org', 'hotelnewsresource.com',
+                     'restaurant.org', 'culinaryinstitute.edu', 'unwto.org', 'wttc.org'],
+            'search_terms': ['hospitality management', 'guest service', 'hotel operations',
+                           'culinary training', 'tourism management', 'travel industry']
+        },
+        'construction': {
+            'keywords': ['construction', 'building', 'contractor', 'project management',
+                        'architecture', 'surveying', 'excavation', 'concrete', 'plumbing',
+                        'electrical installation', 'HVAC', 'carpentry'],
+            'sites': ['constructionequipment.com', 'forconstructionpros.com', 'agc.org',
+                     'nahb.org', 'constructionexec.com'],
+            'search_terms': ['construction safety', 'building codes', 'project planning',
+                           'construction management', 'trade skills']
+        },
+        'business': {
+            'keywords': ['business', 'management', 'leadership', 'strategy', 'executive',
+                        'entrepreneur', 'corporate', 'organization', 'planning'],
+            'sites': ['hbr.org', 'mckinsey.com', 'bcg.com', 'gsb.stanford.edu', 
+                     'mitsloan.mit.edu', 'iima.ac.in', 'iimb.ac.in'],
+            'search_terms': ['business insights', 'management research', 'executive education',
+                           'strategic framework', 'organizational development']
+        }
+    }
+    
+    @classmethod
+    def detect_domain(cls, topic: str) -> Tuple[str, Dict]:
+        """Detect domain from topic and return domain info"""
+        topic_lower = topic.lower()
+        
+        # Score each domain
+        scores = {}
+        for domain, info in cls.DOMAIN_PATTERNS.items():
+            score = sum(1 for keyword in info['keywords'] if keyword in topic_lower)
+            scores[domain] = score
+        
+        # Get highest scoring domain (default to business if no match)
+        best_domain = max(scores.items(), key=lambda x: x[1])
+        
+        if best_domain[1] > 0:
+            return best_domain[0], cls.DOMAIN_PATTERNS[best_domain[0]]
+        else:
+            return 'business', cls.DOMAIN_PATTERNS['business']
+    
+    @classmethod
+    def get_all_domains(cls) -> List[str]:
+        """Return list of all supported domains"""
+        return list(cls.DOMAIN_PATTERNS.keys())
+        # NEXUS Learning Generator - Part 2 (Helper Functions)
+
+def extract_site_name(url: str) -> str:
+    """Extract clean site name from URL"""
+    site_map = {
+        'hbr.org': 'Harvard Business Review',
+        'mckinsey.com': 'McKinsey & Company',
+        'bcg.com': 'Boston Consulting Group',
+        'pubmed.ncbi.nlm.nih.gov': 'PubMed/NIH',
+        'nejm.org': 'New England Journal of Medicine',
+        'bmj.com': 'BMJ Journals',
+        'thelancet.com': 'The Lancet',
+        'ieee.org': 'IEEE',
+        'asme.org': 'ASME',
+        'ase.com': 'ASE - Automotive Service Excellence',
+        'sae.org': 'SAE International',
+        'stackoverflow.com': 'Stack Overflow',
+        'github.com': 'GitHub',
+        'coursera.org': 'Coursera',
+        'udacity.com': 'Udacity',
+        'edutopia.org': 'Edutopia',
+        'ascd.org': 'ASCD',
+        'investopedia.com': 'Investopedia',
+        'cfainstitute.org': 'CFA Institute',
+        'hubspot.com': 'HubSpot',
+        'salesforce.com': 'Salesforce',
+        'iima.ac.in': 'IIM Ahmedabad',
+        'iimb.ac.in': 'IIM Bangalore',
+        'iimcal.ac.in': 'IIM Calcutta',
+        'iiml.ac.in': 'IIM Lucknow',
+        'gsb.stanford.edu': 'Stanford GSB',
+        'mitsloan.mit.edu': 'MIT Sloan',
+        'aao.org': 'American Academy of Ophthalmology',
+        'acc.org': 'American College of Cardiology',
+        'medscape.com': 'Medscape',
+        'who.int': 'World Health Organization',
+        'mayoclinic.org': 'Mayo Clinic',
+        'cdc.gov': 'CDC',
+        'nih.gov': 'National Institutes of Health',
+        'unwto.org': 'UN World Tourism Organization',
+        'wttc.org': 'World Travel & Tourism Council'
+    }
+    
+    try:
+        domain = urlparse(url).netloc.replace('www.', '')
+        
+        for key, name in site_map.items():
+            if key in domain:
+                return name
+        
+        if '.edu' in domain:
+            parts = domain.split('.')
+            return ' '.join(word.title() for word in parts[0].split('-'))
+        
+        name = domain.split('.')[0]
+        return name.replace('-', ' ').replace('_', ' ').title()
+        
+    except:
+        return 'Research Source'
+
+
+def generate_fallback_sources(topic: str, domain: str, domain_info: Dict) -> List[Dict]:
+    """Generate generic fallback sources when search fails"""
+    sources = []
+    
+    for i, site in enumerate(domain_info['sites'][:3]):
+        site_name = extract_site_name(f"https://{site}")
+        
+        sources.append({
+            'site': site_name,
+            'title': f'{topic} - Professional Resources',
+            'snippet': f'Explore {domain_info["search_terms"][0]} and training materials on {topic}',
+            'url': f'https://{site}/search?q={topic.replace(" ", "+")}'
+        })
+    
+    return sources
+
+
+def remove_duplicate_sources(sources: List[Dict]) -> List[Dict]:
+    """Remove duplicate sources based on URL"""
+    seen_urls = set()
+    unique_sources = []
+    
+    for source in sources:
+        if source['url'] not in seen_urls:
+            seen_urls.add(source['url'])
+            unique_sources.append(source)
+    
+    return unique_sources
+
+
+def fetch_research(topic: str) -> Dict:
+    """Universal research fetcher that works for any domain"""
+    result = {'sources': [], 'has_live': True, 'domain': None}
+    
+    domain, domain_info = DomainDetector.detect_domain(topic)
+    result['domain'] = domain
+    
+    print(f"[INFO] Detected domain: {domain}")
+    
+    gkey, gcse = os.environ.get('GOOGLE_API_KEY'), os.environ.get('GOOGLE_CSE_ID')
+    
+    if gkey and gcse:
+        try:
+            from googleapiclient.discovery import build
+            svc = build("customsearch", "v1", developerKey=gkey)
+            
+            search_queries = []
+            
+            for site in domain_info['sites'][:3]:
+                search_queries.append(f'"{topic}" site:{site}')
+            
+            for search_term in domain_info['search_terms'][:2]:
+                search_queries.append(f'"{topic}" {search_term}')
+            
+            search_queries.append(f'"{topic}" training curriculum site:.edu')
+            search_queries.append(f'"{topic}" professional development guide')
+            
+            print(f"[INFO] Running {len(search_queries)} search queries...")
+            
+            for query in search_queries:
+                try:
+                    res = svc.cse().list(q=query, cx=gcse, num=3).execute()
+                    if res.get('items'):
+                        for item in res['items']:
+                            url = item.get('link', '')
+                            
+                            skip_keywords = ['careers', 'jobs', '/product/', 'store.', 
+                                           'apply', 'employment', 'hiring', '/overview']
+                            if any(keyword in url.lower() for keyword in skip_keywords):
+                                continue
+                            
+                            site_name = extract_site_name(url)
+                            
+                            result['sources'].append({
+                                'site': site_name,
+                                'title': item.get('title', ''),
+                                'snippet': item.get('snippet', ''),
+                                'url': url
+                            })
+                            
+                            print(f"[RESEARCH] Found: {site_name} - {item.get('title', '')[:50]}...")
+                            
+                            if len(result['sources']) >= 6:
+                                break
+                                
+                except Exception as e:
+                    print(f"[RESEARCH ERROR] Query '{query[:50]}...': {str(e)}")
+                    
+                if len(result['sources']) >= 6:
+                    break
+                    
+        except Exception as e:
+            print(f"[RESEARCH ERROR] Google API: {str(e)}")
+    
+    if len(result['sources']) == 0:
+        print(f"[INFO] Using fallback sources for {domain}")
+        result['sources'] = generate_fallback_sources(topic, domain, domain_info)
+    
+    result['sources'] = remove_duplicate_sources(result['sources'])
+    
+    print(f"[INFO] Total sources found: {len(result['sources'])}")
+    
+    return result
+
+
+def gen_synopsis(topic, aud_lvl, fmt, dur, res):
+    """Generate instructions instead of synopsis"""
+    mods = 3 if dur=="1 Day (6-7 hours)" else 5
+    domain = res.get('domain', 'business')
+    
+    instructions = f"""# How to Use NEXUS for: {topic}
+
+## 📋 What You're About to Generate
+
+**Format:** {fmt}
+**Domain:** {domain.title()}
+**Audience:** {aud_lvl}
+**Duration:** {dur}
+**Modules/Sessions:** {mods if fmt == "Training" else (4 if dur=="1 Day (6-7 hours)" else 8) if fmt == "Workshop" else (6 if dur=="1 Day (6-7 hours)" else 12)}
+
+---
+
+## 🚀 Quick Start Guide
+
+### Step 1: Review Your Settings
+- Check that the topic, audience level, format, and duration are correct above
+- If needed, go back and adjust before generating
+
+### Step 2: Add Company Customization (Optional)
+- **Company Name**: Enter the company receiving this training
+- **Company Context**: Add specific details (size, industry, challenges, goals)
+- This will customize all examples, case studies, and context for that company
+
+### Step 3: Click Generate
+- Wait 30-60 seconds while NEXUS:
+  - Detects the domain ({domain})
+  - Researches authoritative sources
+  - Generates complete curriculum
+  - Creates facilitator guide
+  - Builds participant handout
+
+### Step 4: Review & Unlock
+- Review the generated content structure
+- Click "Unlock Full Access" to view everything
+- All materials will be immediately available
+
+---
+
+## 📦 What You'll Get
+
+### 1. Complete Training Content
+"""
+
+    if fmt == "Training":
+        instructions += f"""- **{mods} Full Modules** with detailed frameworks
+- Context & Challenge sections for each module
+- Proven frameworks with step-by-step instructions
+- Real-world examples and case studies
+- Practice exercises (35 min each)
+- Curated video resources (under 3 min each)
+- Group dialogue questions
+- 30-day implementation plan
+"""
+    elif fmt == "Workshop":
+        sess = 4 if dur=="1 Day (6-7 hours)" else 8
+        instructions += f"""- **{sess} Interactive Sessions** with hands-on activities
+- Opening activities (15 min each)
+- Core content with frameworks (30 min)
+- Group activities (30 min)
+- Debrief and reflection (15 min)
+- Templates and tools for each session
+"""
+    else:
+        wks = 6 if dur=="1 Day (6-7 hours)" else 12
+        instructions += f"""- **{wks}-Week Action Learning Journey**
+- Challenge selection and framing
+- Deep dive and analysis activities
+- Solution development process
+- Implementation planning
+- Weekly 90-min session structure
+- Coaching questions for each phase
+"""
+
+    instructions += """
+### 2. Facilitator Guide
+- Opening messages for each module/session
+- Key talking points
+- Discussion questions
+- Transition statements
+
+### 3. Participant Handout
+- Structured note-taking space
+- Key concepts summary
+- Framework overviews
+- Action planning templates
+
+### 4. PowerPoint Export
+- AI-ready prompt for Gamma/GenSpark
+- Instant PPT generation capability
+- Professional design automation
+
+---
+
+## 💡 Pro Tips
+
+**For Best Results:**
+1. Be specific with your topic (e.g., "Strategic Planning for Healthcare" vs just "Planning")
+2. Add company context for highly customized content
+3. Choose audience level carefully - it shapes all frameworks and examples
+4. Review the Sample tab to see output quality
+
+**After Generation:**
+1. Review all tabs before unlocking
+2. Use the PPT Export feature for quick presentations
+3. Customize examples with your own company stories
+4. Adapt exercises to your specific time constraints
+
+---
+
+"""
+
+    if res.get('has_live') and res.get('sources'):
+        instructions += f"## 📚 Research Foundation ({domain.title()} Domain)\n\n"
+        instructions += "Your content will be based on authoritative sources including:\n"
+        instructions += ", ".join([x['site'] for x in res['sources'][:3]])
+        instructions += "\n\n"
+    
+    instructions += "**Ready? Click the 'Generate' button to create your complete training program!**"
+    
+    return instructions
+
+
+def get_audience_description(aud_lvl: str, domain: str) -> str:
+    """Get audience description based on level and domain"""
+    
+    if domain in ['medical']:
+        aud_map = {
+            "Executive": "healthcare executives - strategic, policy focus, ROI",
+            "Manager": "clinical managers - workflow, quality, team coordination",
+            "Emerging": "residents/fellows - evidence-based, protocols, exam prep",
+            "Individual": "practicing clinicians - advanced techniques, patient care"
+        }
+    elif domain in ['engineering', 'automotive', 'manufacturing', 'construction']:
+        aud_map = {
+            "Executive": "engineering leaders - innovation, technical strategy",
+            "Manager": "technical managers - project delivery, team guidance",
+            "Emerging": "entry-level engineers - fundamentals, safety, standards",
+            "Individual": "senior engineers - advanced techniques, optimization"
+        }
+    elif domain in ['it_software']:
+        aud_map = {
+            "Executive": "tech executives - digital transformation, architecture",
+            "Manager": "engineering managers - agile, delivery, team velocity",
+            "Emerging": "junior developers - coding basics, best practices",
+            "Individual": "senior developers - system design, performance"
+        }
+    elif domain in ['finance']:
+        aud_map = {
+            "Executive": "finance executives - strategic capital allocation, M&A",
+            "Manager": "finance managers - budgeting, reporting, controls",
+            "Emerging": "analysts - financial modeling, valuation basics",
+            "Individual": "professionals - specialized analysis, compliance"
+        }
+    elif domain in ['legal']:
+        aud_map = {
+            "Executive": "partners/GCs - firm strategy, risk management",
+            "Manager": "practice managers - team coordination, client service",
+            "Emerging": "associates - legal research, case preparation",
+            "Individual": "practitioners - specialized practice areas"
+        }
+    elif domain in ['education']:
+        aud_map = {
+            "Executive": "administrators - institutional strategy, policy",
+            "Manager": "department heads - curriculum, faculty development",
+            "Emerging": "new teachers - classroom management, lesson planning",
+            "Individual": "experienced educators - advanced pedagogy"
+        }
+    elif domain in ['hospitality']:
+        aud_map = {
+            "Executive": "hospitality executives - brand strategy, operations",
+            "Manager": "managers - service excellence, team leadership",
+            "Emerging": "supervisors - guest service, shift management",
+            "Individual": "professionals - specialized roles, expertise"
+        }
+    else:  # Business default
+        aud_map = {
+            "Executive": "executive - strategic, skip basics, ROI focus",
+            "Manager": "manager - balance strategy+tactics, team focus",
+            "Emerging": "emerging - foundational, clear explanations",
+            "Individual": "individual - personal effectiveness, technical"
+        }
+    
+    # Match audience level
+    for key, desc in aud_map.items():
+        if key.lower() in aud_lvl.lower():
+            return desc
+    
+    return f"tailor for {aud_lvl}"
+
+
+def get_framework_guidance(topic: str, aud_lvl: str, domain: str, num_modules: int) -> str:
+    """Generate domain-specific framework guidance"""
+    
+    if domain in ['medical']:
+        if "Executive" in aud_lvl:
+            return f"FRAMEWORKS FOR HEALTHCARE EXECUTIVES ({num_modules} modules): Strategic healthcare transformation, quality improvement systems, clinical outcomes optimization, regulatory compliance, and organizational excellence. Focus on evidence-based leadership and population health."
+        elif "Manager" in aud_lvl:
+            return f"FRAMEWORKS FOR CLINICAL MANAGERS ({num_modules} modules): Workflow optimization, team coordination, quality metrics, patient safety protocols, resource management, and clinical effectiveness. Focus on operational excellence."
+        else:
+            return f"FRAMEWORKS FOR CLINICAL TRAINING ({num_modules} modules): Evidence-based diagnostic protocols, treatment algorithms, patient safety systems, clinical decision-making frameworks, and outcome measurement. Emphasis on best practices and standards of care."
+    
+    elif domain in ['engineering', 'automotive', 'manufacturing', 'construction']:
+        if "Executive" in aud_lvl:
+            return f"FRAMEWORKS FOR ENGINEERING LEADERS ({num_modules} modules): Technical innovation strategy, R&D management, product development lifecycle, quality systems implementation, and engineering excellence. Focus on competitive technical advantage."
+        elif "Manager" in aud_lvl:
+            return f"FRAMEWORKS FOR TECHNICAL MANAGERS ({num_modules} modules): Design reviews, technical planning, quality assurance, team collaboration, delivery management, and engineering execution. Focus on project success."
+        else:
+            return f"FRAMEWORKS FOR TECHNICAL TRAINING ({num_modules} modules): Diagnostic procedures, systematic troubleshooting, safety protocols, technical standards, quality control, and practical skills development. Emphasis on certification readiness."
+    
+    elif domain == 'it_software':
+        if "Executive" in aud_lvl:
+            return f"FRAMEWORKS FOR TECH EXECUTIVES ({num_modules} modules): Digital transformation strategy, technology architecture, innovation pipelines, scalability planning, and technical strategy. Focus on competitive technology advantage."
+        elif "Manager" in aud_lvl:
+            return f"FRAMEWORKS FOR ENGINEERING MANAGERS ({num_modules} modules): Agile methodologies, sprint planning, technical debt management, team velocity optimization, code quality, and delivery excellence. Focus on engineering productivity."
+        else:
+            return f"FRAMEWORKS FOR SOFTWARE DEVELOPMENT ({num_modules} modules): Design patterns, coding standards, testing strategies, debugging techniques, performance optimization, and software craftsmanship. Emphasis on clean code."
+    
+    elif domain == 'finance':
+        return f"FRAMEWORKS FOR FINANCIAL PROFESSIONALS ({num_modules} modules): Financial modeling, risk assessment, portfolio management, regulatory compliance, investment analysis, and data-driven decision making. Emphasis on analytical rigor."
+    
+    elif domain == 'legal':
+        return f"FRAMEWORKS FOR LEGAL PROFESSIONALS ({num_modules} modules): Legal research methodologies, case analysis, client counseling, ethical considerations, professional practice standards, and critical thinking. Emphasis on professional judgment."
+    
+    elif domain == 'education':
+        return f"FRAMEWORKS FOR EDUCATORS ({num_modules} modules): Instructional design, learning assessment, classroom management, differentiation strategies, student engagement, and evidence-based teaching practices. Emphasis on learning outcomes."
+    
+    elif domain == 'sales_marketing':
+        return f"FRAMEWORKS FOR SALES & MARKETING ({num_modules} modules): Customer insights, market segmentation, campaign design, sales methodology, performance metrics, and customer-centric approaches. Emphasis on revenue growth."
+    
+    elif domain == 'hospitality':
+        return f"FRAMEWORKS FOR HOSPITALITY PROFESSIONALS ({num_modules} modules): Guest service excellence, operational efficiency, team leadership, quality standards, revenue management, and customer experience. Emphasis on service delivery."
+    
+    else:  # Business default
+        if "Executive" in aud_lvl:
+            return f"FRAMEWORKS FOR EXECUTIVES ({num_modules} modules): Strategic planning, competitive analysis, opportunity creation, portfolio prioritization, market positioning, growth strategy, and performance management. Focus on strategic ROI."
+        elif "Manager" in aud_lvl:
+            return f"FRAMEWORKS FOR MANAGERS ({num_modules} modules): Leadership frameworks, execution discipline, goal alignment, team development, delegation mastery, and performance management. Focus on tactical execution."
+        elif "Emerging" in aud_lvl:
+            return f"FRAMEWORKS FOR EMERGING LEADERS ({num_modules} modules): Team dynamics, basic delegation, goal setting, constructive feedback, personal prioritization, and foundational leadership. Focus on core skills."
+        else:
+            return f"FRAMEWORKS FOR INDIVIDUAL CONTRIBUTORS ({num_modules} modules): Personal effectiveness, prioritization, workflow management, continuous learning, structured communication, and self-assessment. Focus on productivity."
+
+
+AUD_MAP = {
+    "Executive/C-Suite/Senior Leadership": "executive - strategic, skip basics, ROI focus",
+    "Manager/Supervisor/Team Lead": "manager - balance strategy+tactics, team focus",
+    "Emerging/New/First-Time Leader": "emerging - foundational, clear explanations",
+    "Individual Contributor/Specialist": "individual - personal effectiveness, technical"
+}
+# NEXUS Learning Generator - Part 3 (Content Generation with Enhanced Company Customization)
+
+def gen_training(topic, aud, dur, res, aud_lvl, company_name="", company_context=""):
+    mods = 3 if dur == "1 Day (6-7 hours)" else 5
+    domain = res.get('domain', 'business')
+
+    lvl = get_audience_description(aud_lvl, domain)
+    framework_guidance = get_framework_guidance(topic, aud_lvl, domain, mods)
+
+    company_info = ""
+    if company_name or company_context:
+        company_info = "\n\nCOMPANY-SPECIFIC CUSTOMIZATION - CRITICAL INSTRUCTIONS:\n\n"
+        
+        if company_name:
+            company_info += f"COMPANY NAME: {company_name}\n\n"
+            company_info += f"MANDATORY RESEARCH REQUIREMENTS FOR {company_name}:\n"
+            company_info += f"You MUST research and integrate the following about {company_name}:\n\n"
+            company_info += f"1. INDUSTRY & BUSINESS MODEL:\n"
+            company_info += f"   - What industry/sector does {company_name} operate in?\n"
+            company_info += f"   - What is their primary business model and revenue streams?\n"
+            company_info += f"   - Company size (employees, revenue, market cap if public)\n"
+            company_info += f"   - Key products/services they offer\n\n"
+            
+            company_info += f"2. RECENT NEWS & DEVELOPMENTS:\n"
+            company_info += f"   - Recent announcements, launches, or initiatives from {company_name}\n"
+            company_info += f"   - Any challenges or opportunities mentioned in news\n"
+            company_info += f"   - Strategic direction or transformation efforts\n"
+            company_info += f"   - Recent leadership changes or organizational shifts\n\n"
+            
+            company_info += f"3. COMPETITIVE LANDSCAPE:\n"
+            company_info += f"   - Who are {company_name}'s main competitors?\n"
+            company_info += f"   - Market position and competitive advantages\n"
+            company_info += f"   - Industry trends affecting {company_name}\n"
+            company_info += f"   - How competitors are addressing similar challenges\n\n"
+            
+            company_info += f"4. MARKET TRENDS SPECIFIC TO {company_name}:\n"
+            company_info += f"   - Industry-specific trends affecting their sector\n"
+            company_info += f"   - Technology disruptions in their market\n"
+            company_info += f"   - Regulatory or policy changes impacting them\n"
+            company_info += f"   - Customer/market shifts relevant to their business\n\n"
+        
+        if company_context:
+            company_info += f"ADDITIONAL CONTEXT PROVIDED:\n{company_context}\n\n"
+            company_info += f"You MUST synthesize this context with your research to create highly relevant content.\n\n"
+        
+        company_info += f"\nHOW TO USE THIS INFORMATION:\n\n"
+        company_info += f"A. MARKET CONTEXT & TRENDS Section:\n"
+        company_info += f"   - DO NOT use generic statistics\n"
+        company_info += f"   - USE statistics and trends SPECIFIC to {company_name if company_name else 'their'} industry\n"
+        company_info += f"   - CONNECT trends directly to {company_name if company_name else 'their company'} situation\n"
+        company_info += f"   - Example: Instead of 'Companies struggle with X', write '{company_name if company_name else 'Companies in [their industry]'} faces pressure from Y trend'\n\n"
+        
+        company_info += f"B. BUSINESS IMPACT Section:\n"
+        company_info += f"   - QUANTIFY impact using metrics relevant to {company_name if company_name else 'their'} business model\n"
+        company_info += f"   - Reference {company_name if company_name else 'their'} specific challenges from context/research\n"
+        company_info += f"   - Use industry benchmarks for {company_name if company_name else 'their'} sector\n"
+        company_info += f"   - Connect to their revenue model, customer base, or operational metrics\n\n"
+        
+        company_info += f"C. WHY NOW Section:\n"
+        company_info += f"   - Reference RECENT developments affecting {company_name if company_name else 'this company'}\n"
+        company_info += f"   - Connect urgency to {company_name if company_name else 'their'} strategic priorities\n"
+        company_info += f"   - Mention competitor moves or market shifts creating urgency\n\n"
+        
+        company_info += f"D. CONTEXT & CHALLENGE in Each Module:\n"
+        company_info += f"   - DO NOT copy-paste the company context verbatim\n"
+        company_info += f"   - TRANSFORM it: Add analysis, connect to module topic, provide insights\n"
+        company_info += f"   - Make it specific: 'As a {company_name if company_name else '[industry type]'} company facing [specific challenge from context], your teams are experiencing...'\n"
+        company_info += f"   - Add market intelligence: Reference what competitors or industry leaders are doing\n\n"
+        
+        company_info += f"E. COST OF STANDING STILL Section:\n"
+        company_info += f"   - Connect directly to '{topic}' for {company_name if company_name else 'this company'}\n"
+        company_info += f"   - Calculate opportunity cost in their business terms (revenue, market share, efficiency)\n"
+        company_info += f"   - Reference what {company_name if company_name else 'their'} competitors are doing differently\n"
+        company_info += f"   - Use industry-specific metrics and timeframes\n"
+        company_info += f"   - Example: 'For a company like {company_name if company_name else '[their type]'}, delaying {topic} means...'\n\n"
+        
+        company_info += f"F. EXAMPLES Throughout:\n"
+        company_info += f"   - Use companies similar to {company_name if company_name else 'theirs'} in examples\n"
+        company_info += f"   - Reference {company_name if company_name else 'their'} industry peers\n"
+        company_info += f"   - If using {company_name}, base it on researched facts, not assumptions\n"
+        company_info += f"   - Make case studies relevant to their sector and scale\n\n"
+        
+        company_info += f"CRITICAL: Every section must feel like it was custom-built for {company_name if company_name else 'this specific company'}, not generic content with the company name dropped in.\n\n"
+
+    rctx = ""
+    if res.get('has_live') and res.get('sources'):
+        for s in res['sources'][:2]:
+            rctx += f"{s['site']}: {s['snippet'][:150]}\n"
+    else:
+        rctx = f"Use general {domain} knowledge and best practices"
+
+   # Build the prompt WITHOUT f-string for the template parts
+    context_guidance = ""
+    if company_name or company_context:
+        context_guidance = f"[RESEARCH AND SYNTHESIZE: Based on {company_name} being a {company_context}, describe their current situation. DO NOT copy-paste. Add market analysis, industry trends, competitive pressures. Make it insightful, not regurgitated.]"
+    else:
+        context_guidance = "Where they are right now - e.g., Facing pressure to deliver faster with fewer resources"
+    
+    challenge_guidance = ""
+    if company_name:
+        challenge_guidance = f"[SPECIFIC TO {company_name}: What is the exact problem they face related to {topic}? Reference their industry, scale, and situation. Be specific about what keeps their leaders up at night.]"
+    else:
+        challenge_guidance = "The specific problem keeping them up at night"
+    
+    landscape_guidance = ""
+    if company_name:
+        landscape_guidance = f"[FOR {company_name} SPECIFICALLY: What has changed in their industry/market in the last 12-24 months? Reference competitor moves, technology shifts, regulatory changes, or customer behavior changes affecting them. 2-3 sentences with real market intelligence.]"
+    else:
+        landscape_guidance = "2-3 sentences about what is different in their world"
+    
+    cost_guidance = ""
+    if company_name:
+        cost_guidance = f"""* [QUANTIFIED FOR {company_name}]: If they delay action on {topic}, what is the financial/market/competitive cost? Use their revenue scale, market position, and industry benchmarks. Example: 'For a company at {company_name}'s scale, a 6-month delay in {topic} could mean $X in lost revenue or Y% market share erosion'
+* [COMPETITIVE THREAT]: Name 2-3 competitors or industry peers who are already advancing on {topic} - what advantage are they gaining?
+* [OPPORTUNITY COST]: What strategic opportunities become inaccessible if {company_name} doesn't develop capability in {topic}? Reference market trends in their sector."""
+    else:
+        cost_guidance = """* Specific consequence 1 with data/example
+* Specific consequence 2 with data/example
+* What competitors/peers are doing that they are not"""
+    
+    opportunity_guidance = ""
+    if company_name:
+        opportunity_guidance = f"[FOR {company_name}]: 1-2 sentences about what competitive advantage or market position becomes possible when they master {topic}. Connect to their strategic goals or growth plans if mentioned in context."
+    else:
+        opportunity_guidance = "1-2 sentences about what becomes possible when they master this"
+    
+    patterns_guidance = ""
+    if company_name:
+        patterns_guidance = f"[IN {company_name}'S INDUSTRY]: 1. Pattern/behavior specific to their sector that doesn't work\n2. Another pattern common in their type of organization\n3. Third pattern that {company_name} might be experiencing"
+    else:
+        patterns_guidance = "1. Pattern/behavior that does not work - be specific\n2. Pattern/behavior that does not work - be specific\n3. Pattern/behavior that does not work - be specific"
+    
+    hidden_cost_guidance = ""
+    if company_name:
+        hidden_cost_guidance = f"[CALCULATED FOR {company_name}]: Describe what delaying {topic} REALLY costs them - in their currency, their timeframes, their market metrics. Example: 'For {company_name} with X employees and Y revenue, ineffective {topic} wastes approximately Z hours per employee per quarter, equivalent to $A in opportunity cost.' Use their business model to quantify."
+    else:
+        hidden_cost_guidance = "Describe what it REALLY costs - time, money, credibility, opportunity - with specific example"
+    
+    example_guidance = ""
+    if company_name:
+        example_guidance = f"Quick scenario showing this step in context of {company_name}'s industry"
+    else:
+        example_guidance = "Quick real scenario showing this step"
+    
+    real_example_guidance = ""
+    if company_name:
+        real_example_guidance = f"[Use a company similar to {company_name} in industry, scale, or situation] or [Use {company_name} if you have researched facts about their initiatives]"
+    else:
+        real_example_guidance = "Real or realistic company name"
+    
+    industry_guidance = ""
+    if company_name:
+        industry_guidance = f"[{company_name}'s industry or similar]"
+    else:
+        industry_guidance = "Industry"
+    
+    exercise_guidance = ""
+    if company_name:
+        exercise_guidance = f"How this exercise applies directly to challenges at {company_name}"
+    else:
+        exercise_guidance = "How this exercise mirrors real work"
+    
+    opening_q_guidance = ""
+    if company_name:
+        opening_q_guidance = f"Specific question connecting to {company_name}'s situation and {topic}"
+    else:
+        opening_q_guidance = "Specific, personal question that connects to their experience - starts with Think about a time when or In your current role"
+    
+    closing_q_guidance = ""
+    if company_name:
+        closing_q_guidance = f"Action-focused question specific to implementing {topic} at {company_name}"
+    else:
+        closing_q_guidance = "Action-focused question - What will you do differently this week or Which framework will you test first"
+
+    prompt = f"""Create comprehensive training on "{topic}" for {aud_lvl}.
+
+DOMAIN: {domain}
+CRITICAL: Generate ALL {mods} COMPLETE modules.
+
+AUDIENCE: {aud_lvl} ({lvl})
+MODULES: {mods}
+RESEARCH: {rctx}
+
+{company_info}
+
+{framework_guidance}
+
+CRITICAL: START THE ENTIRE TRAINING WITH THIS OPENING (ONLY ONCE AT THE TOP):
+
+## Why {topic} Matters Now
+
+**Market Context & Trends:**
+* Statistic with percentage (Source: McKinsey/HBR/Gartner)
+* Data point about impact (Source: Research firm)
+* Comparison with percentage (Source: Watson Wyatt/BCG)
+* Market size/growth with numbers (Source: MarketsandMarkets/IDC)
+* Executive perspective with percentage (Source: Harvard Business Review)
+
+**Business Impact:**
+* Productivity stat with percentage (Source: McKinsey/Bain)
+* Employee stat with percentage (Source: Gallup/Deloitte)
+* Financial performance stat (Source: Watson Wyatt/PwC)
+* Quality improvement stat (Source: HBR/MIT)
+* Revenue/efficiency stat with range (Source: McKinsey/Forrester)
+
+**Why Now:**
+* Recent trend making topic urgent (Source: HBR/McKinsey)
+* Technology changes requiring adaptation (Source: McKinsey/Gartner)
+* Workforce changes (Source: Gallup/Deloitte)
+* New opportunities and challenges (Source: HBR/MIT Sloan)
+
+---
+
+## Context & Challenge
+
+**Context:**
+{context_guidance}
+
+**Challenge:**
+{challenge_guidance}
+
+**The Landscape Has Changed:**
+{landscape_guidance}
+
+**The Cost of Standing Still:**
+{cost_guidance}
+
+**The Opportunity:**
+{opportunity_guidance}
+
+---
+
+THEN FOR EACH MODULE USE THIS STRUCTURE:
+
+## MODULE [NUMBER]: [Module Title]
+
+**Duration:** 90 min
+
+### What You Will Walk Away With
+
+By the end of this module:
+
+1. Specific outcome 1 - What they will be able to DO differently
+2. Specific outcome 2 - What they will be able to DO differently
+3. Specific outcome 3 - What they will be able to DO differently
+
+NOT theory. NOT concepts. ACTIONS to take Monday morning.
+
+---
+**Tools & Templates:**
+- Template 1: Specific template name related to the module topic
+- Template 2: Specific worksheet name related to the framework
+- Template 3: Specific tool name for implementation
+
+**How to Find Templates:**
+- Google Search: "{topic} template [specific need]"
+- Google Search: "[framework name] worksheet template"
+- Google Search: "{topic} implementation tool template"
+
+---
+
+**Myths vs Reality:**
+* Myth: Common belief
+  Reality: What is actually true, with example
+
+* Myth: Common belief
+  Reality: What is actually true, with example
+
+**The Hidden Cost:**
+{hidden_cost_guidance}
+
+---
+
+### The Core Frameworks (1-3 Maximum)
+
+### Framework 1: FRAMEWORK NAME
+
+**What It Is (In Plain Language):**
+2-3 sentence explanation anyone could understand
+
+**Why It Works:**
+The principle behind it - why this approach is effective
+
+**When To Use It:**
+* Specific situation 1
+* Specific situation 2
+* Specific situation 3
+
+**When NOT To Use It:**
+* Situation where it fails or backfires
+* Alternative approach for those situations
+
+**The Framework in Action:**
+
+CRITICAL: This section must be DETAILED and ELABORATE. Match the number of steps to the "Walk Away With" outcomes. Each step should have EXACTLY 3 actions with detailed "How to achieve" guidance.
+
+**Step 1: ACTION VERB - What This Step Does (matches Walk Away outcome 1)**
+
+[Write 3-4 sentences explaining what they are doing and why this step matters. This should directly connect to the first "Walk Away With" outcome.]
+
+- **Action 1:** Specific thing to do with clear instructions
+  - **How to achieve:** Provide detailed step-by-step guidance (3-4 sub-steps). Include specific questions to ask, tools to use, or frameworks to apply. Be concrete and actionable, not just "analyze" or "review" - tell them HOW to do it. For example: "Start by listing all stakeholders on a whiteboard. For each stakeholder, ask: What do they gain? What do they lose? What's their influence level? Then map them on a 2x2 grid of Power vs Interest."
+
+- **Action 2:** Second specific thing to do
+  - **How to achieve:** Again, provide 3-4 detailed sub-steps showing the complete process. Include what tools or templates to use, what questions to ask yourself, or what specific techniques to apply. Example: "Create a spreadsheet with columns for: Current State, Desired State, Gap, Root Cause. For each gap, ask 'Why?' five times to reach the root cause. Then prioritize using Impact vs Effort scoring."
+
+- **Action 3:** Third specific thing to do
+  - **How to achieve:** Detailed guidance with 3-4 concrete sub-steps. Show them the exact process, including what to document, who to involve, or what criteria to use. Example: "Draft your value proposition using this format: For [target customer] who [need/opportunity], our [solution] provides [key benefit] unlike [alternatives]. Test it by asking 3 customers: Does this resonate? What's missing? What would make you act?"
+
+- **Example:** {example_guidance}
+- **Common Mistake:** What people often do wrong at this step and why it fails
+- **Pro Tip:** Advanced technique or insight that makes this step more effective
+
+---
+
+**Step 2: ACTION VERB - What This Step Does (matches Walk Away outcome 2)**
+
+[Write 3-4 sentences explaining what they are doing and why this step matters. This should directly connect to the second "Walk Away With" outcome.]
+
+- **Action 1:** Specific thing to do with clear instructions
+  - **How to achieve:** Provide detailed step-by-step guidance (3-4 sub-steps) with concrete techniques, questions, or frameworks. Make it so clear that someone could execute it without asking follow-up questions.
+
+- **Action 2:** Second specific thing to do
+  - **How to achieve:** Detailed 3-4 sub-steps showing the complete process. Include practical examples of how to do each sub-step.
+
+- **Action 3:** Third specific thing to do
+  - **How to achieve:** Detailed guidance with 3-4 concrete sub-steps. Be specific about tools, templates, questions, or criteria to use.
+
+- **Example:** {example_guidance}
+- **Common Mistake:** What people often do wrong at this step and the consequence
+- **Pro Tip:** Advanced technique that experienced practitioners use
+
+---
+
+**Step 3: ACTION VERB - What This Step Does (matches Walk Away outcome 3)**
+
+[Write 3-4 sentences explaining what they are doing and why this step matters. This should directly connect to the third "Walk Away With" outcome.]
+
+- **Action 1:** Specific thing to do with clear instructions
+  - **How to achieve:** Provide detailed step-by-step guidance (3-4 sub-steps). Show the exact process with specific techniques and methods.
+
+- **Action 2:** Second specific thing to do
+  - **How to achieve:** Detailed 3-4 sub-steps with concrete examples of execution. Include what questions to ask or frameworks to apply.
+
+- **Action 3:** Third specific thing to do
+  - **How to achieve:** Detailed guidance with 3-4 concrete sub-steps. Be explicit about the process and what success looks like.
+
+- **Example:** {example_guidance}
+- **Common Mistake:** What people often do wrong at this step
+- **Pro Tip:** How to do this step even better or faster
+
+---
+
+IMPORTANT: If there are more than 3 "Walk Away With" outcomes, add Step 4, Step 5, etc. following the exact same structure - each step must have 3 actions with detailed "How to achieve" guidance.
+
+**How Long This Takes:**
+Realistic timeframe - e.g., 15 minutes daily for 2 weeks not ongoing
+
+**What Success Looks Like:**
+Describe the specific outcome when this framework is applied correctly
+
+---
+
+### See It in Action: Real Example
+
+**Company:** {real_example_guidance}
+**Industry:** {industry_guidance}
+**Challenge:** Specific problem they faced - 2-3 sentences with context
+
+**What They Did:**
+[Write detailed step-by-step description of implementation]
+Step 1: [What they did in first step with specifics]
+Step 2: [What they did in second step with specifics]
+Step 3: [What they did in third step with specifics]
+[Continue with more steps as needed]
+
+**What Changed:**
+* Measurable result 1 with specific numbers and timeframe
+* Measurable result 2 with specific numbers and timeframe
+* Measurable result 3 with specific numbers and timeframe
+
+**The Key Insight:**
+The one thing that made the biggest difference - 2-3 sentences
+
+---
+
+### Your Turn: Practice Exercise
+
+**What You Will Create:** Specific deliverable
+
+**Why This Matters:** {exercise_guidance}
+
+**Instructions (35 min):**
+
+**Individual Work (15 min):**
+1. Specific step using the framework with clear instructions
+2. Specific step using the framework with clear instructions
+3. Specific step using the framework with clear instructions
+
+**Small Group Discussion (10 min):**
+- Share your deliverable
+- Give and receive feedback on specific aspect
+
+**Refinement (10 min):**
+- Revise based on feedback
+- Prepare to share one key insight
+
+**Tools Provided:**
+- Template 1 name - what it does and how to use it
+- Template 2 name - what it does and how to use it
+- Template 3 name - what it does and how to use it
+
+**Find Templates Online:**
+- Google Search: "{topic} template [specific template type]"
+- Google Search: "{topic} worksheet [framework name]"
+- Google Search: "[framework name] tool template"
+
+---
+
+### Resources to Go Deeper
+
+MANDATORY: You MUST include 3 videos for EVERY module. Do NOT skip this section.
+
+**Video 1: [Specific Title Related to Framework]** (Under 3 min)
+- YouTube search: "{topic} [framework name] explained"
+- Recommended channels: Harvard Business Review, McKinsey, TEDx, [domain-specific channels]
+- What you'll learn: Brief description of video content
+
+**Video 2: [Specific Title Related to Application]** (Under 3 min)
+- YouTube search: "{topic} case study [industry]"
+- Recommended channels: [Domain-specific experts and institutions]
+- What you'll learn: Brief description of video content
+
+**Video 3: [Specific Title Related to Common Mistakes]** (Under 3 min)
+- YouTube search: "{topic} mistakes to avoid"
+- Recommended channels: [Thought leaders in the domain]
+- What you'll learn: Brief description of video content
+
+---
+
+### Group Dialogue
+
+**Opening Question (10 min):**
+{opening_q_guidance}
+
+**Closing Question (10 min):**
+{closing_q_guidance}
+
+---
+
+### One Bold Closing Thought
+
+A provocative statement or challenge that reframes everything - something they will remember
+
+**Next Step:**
+ONE specific action to take in the next 48 hours
+
+---
+
+CRITICAL CHECKLIST - EVERY MODULE MUST HAVE:
+✓ What You Will Walk Away With (3+ outcomes)
+✓ Tools & Templates section (3 templates)
+✓ Find Templates Online (3 Google searches)
+✓ Patterns We See / Myths vs Reality
+✓ The Core Frameworks (Framework in Action with detailed steps)
+✓ See It in Action: Real Example
+✓ Your Turn: Practice Exercise
+✓ Resources to Go Deeper (3 videos - MANDATORY)
+✓ Group Dialogue (Opening + Closing questions)
+✓ One Bold Closing Thought
+
+DO NOT SKIP ANY SECTION. Each module must be complete.
+
+---
+
+REPEAT THIS MODULE STRUCTURE FOR ALL {mods} MODULES.
+
+After all modules, end with:
+
+---
+
+## 30-Day Implementation Roadmap
+
+**Week 1: [Focus Area]**
+- Day 1-2: Specific actions
+- Day 3-4: Specific actions
+- Day 5: Specific milestone
+
+**Week 2: [Focus Area]**
+- Day 8-10: Specific actions
+- Day 11-12: Specific actions
+- Day 14: Specific milestone
+
+**Week 3: [Focus Area]**
+- Day 15-17: Specific actions
+- Day 18-19: Specific actions
+- Day 21: Specific milestone
+
+**Week 4: [Focus Area]**
+- Day 22-24: Specific actions
+- Day 25-26: Specific actions
+- Day 28-30: Specific milestone
+
+---
+
+## Success Metrics
+
+**90-Day Outcomes:**
+* Specific measurable outcome 1
+* Specific measurable outcome 2
+* Specific measurable outcome 3
+
+**6-Month Outcomes:**
+* Specific measurable outcome 1
+* Specific measurable outcome 2
+* Specific measurable outcome 3
+
+---
+
+REMINDER: If company name/context is provided, EVERY section must demonstrate deep research and synthesis, not surface-level customization. The reader should feel "This was built specifically for us" not "They just found-and-replaced our company name into a template."
+
+Remember:
+- Context, Challenge, Landscape, Cost of Standing Still appear ONLY ONCE at the top
+- Each module focuses on specific frameworks and actions
+- Framework in Action section must be DETAILED and ELABORATE with multiple actions per step
+- Include Google search prompts for templates
+- Include 3 video resources per module with search terms
+- Keep language conversational and direct
+- Focus on WHAT CHANGES, not what they learn"""
+
+    return gen_content(prompt, "training", topic, dur, aud_lvl, res)
+def gen_workshop(topic, aud, dur, res, company_name="", company_context=""):
+    sess = 4 if dur=="1 Day (6-7 hours)" else 8
+    domain = res.get('domain', 'business')
+
+    # Use same enhanced company_info from gen_training
+    company_info = ""
+    if company_name or company_context:
+        company_info = "\n\nCOMPANY-SPECIFIC CUSTOMIZATION - CRITICAL INSTRUCTIONS:\n\n"
+        
+        if company_name:
+            company_info += f"COMPANY NAME: {company_name}\n\n"
+            company_info += f"MANDATORY: Research {company_name}'s industry, business model, recent news, competitive landscape, and market trends.\n"
+            company_info += f"CUSTOMIZE: Market Context, Business Impact, Why Now, and all Examples for {company_name}'s specific situation.\n\n"
+        
+        if company_context:
+            company_info += f"ADDITIONAL CONTEXT:\n{company_context}\n\n"
+            company_info += f"TRANSFORM this context with analysis and market intelligence - do NOT copy-paste verbatim.\n\n"
+
+    rctx = ""
+    if res.get('has_live') and res.get('sources'):
+        for s in res['sources'][:2]:
+            rctx += f"{s['site']}: {s['snippet'][:150]}\n"
+    else:
+        rctx = f"Use general {domain} knowledge and best practices"
+    
+    prompt = f"""Create comprehensive workshop on "{topic}" for {aud}. {sess} sessions.
+
+DOMAIN: {domain}
+RESEARCH: {rctx}
+{company_info}
+
+CRITICAL: Generate ALL {sess} complete sessions with exact format below.
+
+FORMAT EACH SESSION EXACTLY AS:
+
+## SESSION NUMBER: Title
+
+**Why This Session:** 
+2-3 sentences explaining why this session matters, what participants will learn, and how it builds on previous sessions or prepares for next ones
+
+**Learning Outcomes - THE HOW:**
+- HOW to specific action using specific tool/framework
+- HOW to specific action using specific tool/framework
+- HOW to specific action using specific tool/framework
+
+**Tools & Templates:**
+- Template name 1
+- Template name 2
+- Template name 3
+
+**How to Find Templates:**
+- Google Search: search term with topic
+- Google Search: search term with framework
+- Google Search: search term with tool
+
+**Real Examples:**
+{"1. Company: [Similar to " + company_name + " in industry/scale]" if company_name else "1. Company: Company Name"} - Industry: Industry
+   Challenge: Problem they faced
+   How: Tool/framework they used
+   Result: Metric/outcome achieved
+
+2. Company: Company Name - Industry: Industry
+   Challenge: Problem they faced
+   How: Tool/framework they used
+   Result: Metric/outcome achieved
+
+---
+
+### Opening Activity (15 min)
+
+**Activity:** Activity Name
+
+**Purpose:** What insight or understanding this creates
+
+**Instructions:**
+1. Step 1 with specific action
+2. Step 2 with specific action
+3. Step 3 with specific action
+
+---
+
+### Core Content (30 min)
+
+**Framework:** Framework Name
+
+**Step-by-Step:**
+
+**Step 1: Action Name**
+- What: Specific description
+- Tool: Specific tool/template
+- Example: {"Brief example from " + company_name + "'s industry" if company_name else "Brief practical example"}
+
+**Step 2: Action Name**
+- What: Specific description
+- Tool: Specific tool/template
+- Example: Brief practical example
+
+**Step 3: Action Name**
+- What: Specific description
+- Tool: Specific tool/template
+- Example: Brief practical example
+
+---
+
+### Group Activity (30 min)
+
+**Activity:** Activity Name
+
+**Materials:** List templates, tools, handouts needed
+
+**Steps:**
+1. Setup (5 min): What facilitator does to prepare groups
+2. Application (20 min): What groups do - specific task description
+3. Prep (5 min): How groups prepare to share
+
+**Deliverable:** Specific output participants create
+
+---
+
+### Debrief (15 min)
+
+- Group shares what they created
+- Key insights on common challenges and successes
+- Real application and action planning for implementation context
+
+---
+
+REPEAT THIS EXACT FORMAT FOR ALL {sess} SESSIONS."""
+
+    return gen_content(prompt, "workshop", topic, dur, aud, res)
+
+
+def gen_action(topic, aud, dur, res, company_name="", company_context=""):
+    wks = 6 if dur=="1 Day (6-7 hours)" else 12
+    domain = res.get('domain', 'business')
+
+    # Use same enhanced company_info
+    company_info = ""
+    if company_name or company_context:
+        company_info = f"\n\nCOMPANY CUSTOMIZATION: For {company_name if company_name else 'this company'}\n"
+        if company_context:
+            company_info += f"Context: {company_context}\n"
+        company_info += f"Customize all content to their specific industry, challenges, and situation.\n\n"
+
+    rctx = ""
+    if res.get('has_live') and res.get('sources'):
+        for s in res['sources'][:2]:
+            rctx += f"{s['site']}: {s['snippet'][:150]}\n"
+    else:
+        rctx = f"Use general {domain} knowledge and best practices"
+    
+    mid_point = wks // 2
+    
+    prompt = f"""Create {wks}-week action learning program on "{topic}" for {aud}.
+
+DOMAIN: {domain}
+RESEARCH: {rctx}
+{company_info}
+
+Format:
+
+## Program Overview
+Duration: {wks} weeks
+Team Size: 4-6 participants
+Format: Action Learning Sets
+
+## Weeks 1-3: Challenge Selection & Framing
+
+**Objective:** Identify and frame a real business challenge
+
+**Activities:**
+* Week 1: Challenge identification and team formation
+* Week 2: Stakeholder mapping and problem definition
+* Week 3: Charter development and success criteria
+
+**Coaching Questions:**
+* What assumptions are you making about this challenge?
+* Who are the key stakeholders and what do they need?
+* How will you measure success?
+
+**Deliverable:** Project Charter with problem statement, scope, and success metrics
+
+---
+
+## Weeks 4-{mid_point}: Deep Dive & Analysis
+
+**Objective:** Understand root causes and gather insights
+
+**Activities:**
+* Data gathering and research
+* Stakeholder interviews and consultations
+* Root cause analysis using appropriate frameworks
+* Hypothesis development and testing
+
+**Coaching Questions:**
+* What data supports or challenges your hypotheses?
+* What patterns are emerging from stakeholder feedback?
+* What are you learning that surprises you?
+
+**Deliverable:** Analysis Report with findings and insights
+
+---
+
+## Weeks {mid_point + 1}-{wks - 2}: Solution Development
+
+**Objective:** Generate and evaluate solution options
+
+**Activities:**
+* Brainstorm alternative solutions
+* Evaluate options against criteria
+* Build recommendations with rationale
+* Prototype and test approaches
+
+**Coaching Questions:**
+* What are the trade-offs between different solutions?
+* How does each option address root causes?
+* What resources and support will be needed?
+
+**Deliverable:** 2-3 Solution Options with pros/cons analysis
+
+---
+
+## Weeks {wks - 1}-{wks}: Implementation Planning
+
+**Objective:** Create actionable implementation roadmap
+
+**Activities:**
+* Develop detailed implementation plan
+* Identify risks and mitigation strategies
+* Build change management approach
+* Prepare final presentation
+
+**Coaching Questions:**
+* What could prevent successful implementation?
+* Who needs to be involved and when?
+* How will you sustain momentum?
+
+**Deliverable:** Implementation roadmap, change plan, and final presentation
+
+---
+
+## Weekly Action Learning Set Structure (90 minutes)
+
+**Check-in (15 min):**
+* Progress updates from each team
+* Obstacles encountered
+
+**Focused Coaching (30 min):**
+* Deep dive on one team challenge
+* Peer coaching and powerful questions
+* Alternative perspectives
+
+**Action Planning (30 min):**
+* Next steps for each team
+* Resource needs and support
+* Accountability commitments
+
+**Reflection (15 min):**
+* Key insights and learning
+* Application to own work
+
+---
+
+## Success Metrics
+
+**Process Measures:**
+* Team engagement and participation
+* Quality of analysis and thinking
+* Stakeholder feedback
+
+**Outcome Measures:**
+* Feasibility and impact of recommendations
+* Leadership capability development
+* Application of learning to work"""
+
+    return gen_content(prompt, "action learning", topic, dur, aud, res)
+
+
+def gen_content(prompt, fmt, topic, dur, aud, res):
+    key = os.environ.get('GROQ_API_KEY')
+    keys_to_try = [key] if key else []
+    if groq_key_2:
+        keys_to_try.append(groq_key_2)
+    if groq_key_3:
+        keys_to_try.append(groq_key_3)
+    if groq_key_4:
+        keys_to_try.append(groq_key_4)
+    
+    if not keys_to_try: 
+        return "Need API key", 0, "", "Error"
+    
+    try:
+        for api_key in keys_to_try:
+            try:
+                client = Groq(api_key=api_key)
+                for model in ["llama-3.3-70b-versatile", "llama-3.1-70b-versatile"]:
+                    try:
+                        resp = client.chat.completions.create(
+                                   model=model,
+                                   messages=[
+                                      {"role": "system", "content": f"""You are an expert {fmt} designer with deep research capabilities. 
+
+CRITICAL REQUIREMENTS - DO NOT SKIP ANY OF THESE:
+
+1. You MUST start EVERY response with this EXACT format:
+
+## Why Topic Matters Now
+
+**Market Context & Trends:**
+* Statistic with percentage (Source: McKinsey/HBR/Gartner).
+* Data point about impact (Source: Research firm).
+* Comparison with percentage (Source: Watson Wyatt/BCG).
+* Market size/growth with numbers (Source: MarketsandMarkets/IDC).
+* Executive perspective with percentage (Source: Harvard Business Review).
+
+**Business Impact:**
+* Productivity stat with percentage (Source: McKinsey/Bain).
+* Employee stat with percentage (Source: Gallup/Deloitte).
+* Financial performance stat (Source: Watson Wyatt/PwC).
+* Quality improvement stat (Source: HBR/MIT).
+* Revenue/efficiency stat with range (Source: McKinsey/Forrester).
+
+**Why Now:**
+* Recent trend making topic urgent (Source: HBR/McKinsey).
+* Technology changes requiring adaptation (Source: McKinsey/Gartner).
+* Workforce changes (Source: Gallup/Deloitte).
+* New opportunities and challenges (Source: HBR/MIT Sloan).
+
+2. MANDATORY FOR EVERY MODULE - Include ALL of these sections:
+   - Tools & Templates (3 templates minimum)
+   - Find Templates Online (3 Google search prompts)
+   - Resources to Go Deeper (EXACTLY 3 videos with YouTube search terms)
+   - Group Dialogue (Opening and Closing questions)
+
+3. Framework in Action MUST have:
+   - Number of steps MATCHING the "Walk Away With" outcomes
+   - EACH step must have EXACTLY 3 actions
+   - EACH action must have detailed "How to achieve" with 3-4 sub-steps
+   - Example, Common Mistake, and Pro Tip for EACH step
+
+4. Then provide all modules with complete format. Then end with 30-Day Implementation Plan and Success Metrics.
+
+Use asterisks for ALL bullet points. Include (Source: Name) for every statistic.
+
+DO NOT SKIP the Resources to Go Deeper section - it is MANDATORY for every module."""},
+                                {"role": "user", "content": prompt}
+                            ],
+                            temperature=0.6, 
+                            max_tokens=32000
+                        )
+                        
+                        content = resp.choices[0].message.content
+                        
+                        domain = res.get('domain', 'business')
+                        footer = f"\n\n---\n\n## Research Sources\n\n"
+                        if res.get('has_live') and res.get('sources'):
+                            footer += f"**Based on {domain.title()} domain research:**\n\n"
+                            for i, s in enumerate(res['sources'], 1):
+                                title = s.get('title', 'Article')
+                                site = s.get('site', '')
+                                url = s.get('url', '')
+                                footer += f"{i}. **{site}**: {title}\n"
+                                if url and url != '#':
+                                    footer += f"   Link: {url}\n"
+                                footer += "\n"
+                            footer += f"*Synthesizes insights from leading {domain} research sources.*\n"
+                        else:
+                            footer += f"**Based on {domain.title()} domain research:**\n\n"
+                            footer += f"Search these resources for '{topic}':\n\n"
+                            for i, site in enumerate(res.get('sources', [])[:3], 1):
+                                site_name = site.get('site', 'Research Source')
+                                site_url = site.get('url', '#')
+                                footer += f"{i}. **{site_name}**: {site_url}\n\n"
+                            footer += f"*Synthesizes insights from authoritative {domain} sources*\n"
+                        
+                        out = f"# {topic} - {fmt}\n**Generated:** {datetime.now().strftime('%Y-%m-%d')}\n**Audience:** {aud}\n**Duration:** {dur}\n**Domain:** {domain.title()}\n\n---\n\n{content}\n{footer}\n---\n\n*By NEXUS*"
+                        return out, time.time(), model, "Success"
+                    except Exception as e:
+                        print(f"Model {model} failed: {e}")
+                        continue
+            except Exception as e:
+                print(f"API key failed: {e}")
+                continue
+        return "Failed", 0, "", "Error"
+    except Exception as e:
+        print(f"Gen content error: {e}")
+        return "Error", 0, "", "Error"
+        # NEXUS Learning Generator - Part 4 (Utility Functions)
+
+def gen_facil(fmt, topic, content):
+    """Generate facilitator talking points"""
+    key = os.environ.get('GROQ_API_KEY')
+    keys_to_try = [key] if key else []
+    if groq_key_2:
+        keys_to_try.append(groq_key_2)
+    if groq_key_3:
+        keys_to_try.append(groq_key_3)
+    if groq_key_4:
+        keys_to_try.append(groq_key_4)
+    
+    for api_key in keys_to_try:
+        try:
+            client = Groq(api_key=api_key)
+            system_msg = "Create concise facilitator talking points for each module"
+            user_msg = f"Create facilitator talking points for {topic}. Content: {content[:4000]} Format: FACILITATOR TALKING POINTS with sections for each module including Opening Message, Key Points, Discussion Questions, and Transition."
+            
+            resp = client.chat.completions.create(
+                model="llama-3.1-8b-instant",
+                messages=[
+                    {"role": "system", "content": system_msg},
+                    {"role": "user", "content": user_msg}
+                ],
+                temperature=0.4,
+                max_tokens=8000
+            )
+            return resp.choices[0].message.content
+        except Exception as e:
+            print(f"Facil gen failed: {e}")
+            continue
+    
+    # Fallback content
+    return f"""# FACILITATOR TALKING POINTS: {topic}
+
+---
+
+## Module 1
+
+**Opening Message:**
+Welcome to this critical module on {topic}. As leaders, you play a vital role in driving organizational success.
+
+**Key Points:**
+* {topic} is a Business Imperative: In today's fast-paced environment, mastering {topic} is essential.
+* Leadership Sets the Tone: Your commitment and involvement are crucial.
+* Strategic Approach: Effective {topic} requires alignment with organizational goals.
+
+**Discussion Questions:**
+* What are some examples of successful {topic} initiatives in your organization?
+* How do you currently approach {topic}, and what are areas for improvement?
+
+**Transition:**
+Now that we have covered the importance of {topic}, let's move on to Module 2.
+
+---
+
+## Module 2
+
+**Opening Message:**
+Building on our foundation, we will now explore practical frameworks and tools you can apply immediately.
+
+**Key Points:**
+* Evidence-based approaches have been proven across industries
+* Your context matters - adapt frameworks to your situation
+* Implementation requires both skill and persistence
+
+**Discussion Questions:**
+* Which framework resonates most with your current challenges?
+* What barriers might you face in implementing these approaches?
+
+**Transition:**
+With these frameworks in hand, let's look at advanced implementation strategies in Module 3."""
+
+
+def gen_handout(fmt, topic, content):
+    key = os.environ.get('GROQ_API_KEY')
+    keys_to_try = [key] if key else []
+    if groq_key_2:
+        keys_to_try.append(groq_key_2)
+    if groq_key_3:
+        keys_to_try.append(groq_key_3)
+    if groq_key_4:
+        keys_to_try.append(groq_key_4)
+    
+    topic_upper = topic.upper()
+    
+    for api_key in keys_to_try:
+        try:
+            client = Groq(api_key=api_key)
+            resp = client.chat.completions.create(
+                model="llama-3.1-8b-instant",
+                messages=[
+                    {"role": "system", "content": "Create participant handout with module titles and structured learning format."},
+                    {"role": "user", "content": f"""Create participant handout for {topic}.
+
+From content: {content[:3000]}
+
+Format EXACTLY like this for EACH module:
+
+# {topic_upper} - PARTICIPANT GUIDE
+
+---
+
+## MODULE 1: Why Topic Now
+
+**Key Concepts:**
+- Market context: Extract from content or write placeholder
+- Business impact: Extract from content or write placeholder
+- Why now: Extract from content or write placeholder
+
+**Framework Overview:**
+1-2 sentence description of the framework covered
+
+**Your Notes:**
+___________________________________________________________________________
+___________________________________________________________________________
+___________________________________________________________________________
+___________________________________________________________________________
+
+---
+
+## MODULE 2: Title from content
+
+**Key Concepts:**
+- Concept 1 from content
+- Concept 2 from content
+- Concept 3 from content
+
+**Framework Overview:**
+Framework name and brief description
+
+**Your Notes:**
+___________________________________________________________________________
+___________________________________________________________________________
+___________________________________________________________________________
+___________________________________________________________________________
+
+---
+
+Repeat this format for ALL modules found in the content."""}
+                ],
+                temperature=0.3, max_tokens=8000
+            )
+            return resp.choices[0].message.content
+        except:
+            continue
+    
+    # Fallback
+    return f"""# {topic_upper} - PARTICIPANT GUIDE
+
+## MODULE 1: Foundation
+
+**Key Concepts:**
+- Concept 1
+- Concept 2
+- Concept 3
+
+**Your Notes:**
+___________________________________________________________________________
+___________________________________________________________________________
+___________________________________________________________________________
+
+"""
+
+
+def prepare_ppt_text(content, topic):
+    """Prepare PowerPoint export instructions and AI prompt"""
+    if not content or content == "Generate & unlock..." or "LOCKED" in content:
+        return "Please generate and unlock content first!", ""
+    
+    lines = content.split('\n')
+    module_info = []
+    
+    for i, line in enumerate(lines):
+        if '**Generated:**' in line or '**Audience:**' in line or '**Duration:**' in line:
+            continue
+        if line.startswith('# MODULE') or line.startswith('## SESSION'):
+            module_info.append(line.strip())
+        elif '**The ' in line and 'Framework**' in line:
+            module_info.append('  ' + line.strip())
+    
+    ppt_prompt = f"""Create a professional presentation on: {topic}
+
+Structure the presentation to cover these key areas:
+
+{chr(10).join(module_info[:30])}
+
+Please create comprehensive slides that:
+- Start with a compelling title slide
+- Include an overview of why this topic matters now
+- Cover each module/section with clear explanations
+- Use bullet points and visuals for frameworks
+- Add real-world examples and case studies
+- End with implementation steps and key takeaways
+
+Make it executive-ready, visually engaging, and actionable."""
+    
+    instructions = f"""# Ready to Create Your Presentation!
+
+**Topic:** {topic}
+
+---
+
+## Option 1: Download Full Content
+
+**Download the complete training content to create slides manually**
+
+### Steps:
+1. Click **"Download Content"** button below (in Content tab)
+2. Copy sections you want to include in your presentation
+3. Paste into PowerPoint, Google Slides, or Keynote
+4. Format and design slides manually
+
+**Best for:** Full control over design and layout
+
+## Option 2: AI-Generated PPT (Recommended)
+
+**Use Gamma AI or GenSpark AI to automatically create your presentation**
+
+### Steps:
+1. **Copy the AI prompt** from the "AI Prompt for Gamma/GenSpark" box below
+2. **Click** "Open Gamma AI" or "Open GenSpark AI" button
+3. **Sign in** with your account credentials
+4. **Paste** the prompt into the AI chat/input field
+5. **Generate** - Let AI create your presentation in minutes!
+
+**Why use AI tools?**
+- Professional design automatically applied
+- Visual layouts and graphics included
+- Faster than manual creation
+- Modern, engaging slide formats
+
+---
+
+
+
+---
+
+**Choose your preferred option below**
+"""
+    
+    return instructions, ppt_prompt
+
+
+def unlock(sess):
+    """Unlock full access to generated content"""
+    if not sess or sess not in payment_state:
+        return "Generate first", "No content", "No content", "Generate first", "Generate first", ""
+    
+    payment_state[sess]['paid'] = True
+    save_state()
+    
+    # Track unlock
+    track_unlock()
+    
+    ppt_inst, ppt_txt = prepare_ppt_text(
+        payment_state[sess]['content'], 
+        payment_state[sess]['topic']
+    )
+    
+    return (
+        payment_state[sess]['content'],
+        payment_state[sess]['facil'],
+        payment_state[sess]['handout'],
+        "UNLOCKED!",
+        ppt_inst,
+        ppt_txt
+    )
+
+
+def create_prog(topic, fmt, dur, aud_lvl, company_name, company_context, sess, progress=gr.Progress()):
+    """Main function to create training program"""
+    if not topic: 
+        return "Enter topic", "Locked", "Locked", "Locked", "Waiting", gr.update(visible=False), None, "Generate first", ""
+    
+    try:
+        start = time.time()
+        sid = gen_session_id()
+        
+        progress(0.1, desc="Detecting domain & researching...")
+        res = fetch_research(topic)
+        domain = res.get('domain', 'business')
+        
+        progress(0.25, desc=f"Creating {domain} instructions...")
+        syn = gen_synopsis(topic, aud_lvl, fmt, dur, res)
+        
+        progress(0.4, desc=f"Generating {fmt} for {domain}...")
+        
+        if fmt=="Training": 
+            cont, gt, mod, stat = gen_training(topic, aud_lvl, dur, res, aud_lvl, company_name, company_context)
+        elif fmt=="Workshop": 
+            cont, gt, mod, stat = gen_workshop(topic, aud_lvl, dur, res, company_name, company_context)
+        else: 
+            cont, gt, mod, stat = gen_action(topic, aud_lvl, dur, res, company_name, company_context)
+        
+        if stat=="Error": 
+            return syn, "Failed", "Failed", "Failed", "Error", gr.update(visible=False), sid, "Error", ""
+        
+        progress(0.7, desc="Creating facilitator guide...")
+        fac = gen_facil(fmt, topic, cont)
+        
+        progress(0.9, desc="Creating participant handout...")
+        hand = gen_handout(fmt, topic, cont)
+        
+        tot = time.time() - start
+        progress(1.0, desc="Done!")
+        
+        # Track generation
+        track_generation(topic, fmt, aud_lvl)
+        
+        payment_state[sid] = {
+            'content': cont, 
+            'facil': fac, 
+            'handout': hand, 
+            'topic': topic,
+            'format': fmt,
+            'audience': aud_lvl,
+            'duration': dur,
+            'domain': domain,
+            'paid': False
+        }
+        save_state()
+        
+        lock = f"# LOCKED\n\nFull {fmt.lower()} after unlock.\n\nClick Unlock."
+        
+        stat_msg = f"""READY!
+
+Time: {tot:.1f}s
+Topic: {topic}
+Domain: {domain.title()}
+Audience: {aud_lvl}
+Format: {fmt}
+
+Instructions: Ready
+Content: Locked
+Facilitator: Locked
+Handout: Locked
+PPT Export: Locked
+
+Click Unlock!"""
+        
+        return syn, lock, lock, lock, stat_msg, gr.update(visible=True), sid, "Generate and unlock to export to PPT", ""
+    except Exception as e:
+        print(f"Error in create_prog: {e}")
+        import traceback
+        traceback.print_exc()
+        return str(e), "Error", "Error", "Error", "Error", gr.update(visible=False), None, "Error", ""
+
+
+# Load saved state on startup
+print("Loading saved state...")
+load_state()
+load_analytics()
+print(f"Loaded {len(payment_state)} existing sessions")
+print(f"Supported domains: {', '.join(DomainDetector.get_all_domains())}")
+
+# Print analytics on startup
+try:
+    print(get_analytics_summary())
+except Exception as e:
+    print(f"Analytics summary error: {e}")
+    # NEXUS Learning Generator - Part 4 (Utility Functions)
+
+def gen_facil(fmt, topic, content):
+    """Generate facilitator talking points"""
+    key = os.environ.get('GROQ_API_KEY')
+    keys_to_try = [key] if key else []
+    if groq_key_2:
+        keys_to_try.append(groq_key_2)
+    if groq_key_3:
+        keys_to_try.append(groq_key_3)
+    if groq_key_4:
+        keys_to_try.append(groq_key_4)
+    
+    for api_key in keys_to_try:
+        try:
+            client = Groq(api_key=api_key)
+            system_msg = "Create concise facilitator talking points for each module"
+            user_msg = f"Create facilitator talking points for {topic}. Content: {content[:4000]} Format: FACILITATOR TALKING POINTS with sections for each module including Opening Message, Key Points, Discussion Questions, and Transition."
+            
+            resp = client.chat.completions.create(
+                model="llama-3.1-8b-instant",
+                messages=[
+                    {"role": "system", "content": system_msg},
+                    {"role": "user", "content": user_msg}
+                ],
+                temperature=0.4,
+                max_tokens=8000
+            )
+            return resp.choices[0].message.content
+        except Exception as e:
+            print(f"Facil gen failed: {e}")
+            continue
+    
+    # Fallback content
+    return f"""# FACILITATOR TALKING POINTS: {topic}
+
+---
+
+## Module 1
+
+**Opening Message:**
+Welcome to this critical module on {topic}. As leaders, you play a vital role in driving organizational success.
+
+**Key Points:**
+* {topic} is a Business Imperative: In today's fast-paced environment, mastering {topic} is essential.
+* Leadership Sets the Tone: Your commitment and involvement are crucial.
+* Strategic Approach: Effective {topic} requires alignment with organizational goals.
+
+**Discussion Questions:**
+* What are some examples of successful {topic} initiatives in your organization?
+* How do you currently approach {topic}, and what are areas for improvement?
+
+**Transition:**
+Now that we have covered the importance of {topic}, let's move on to Module 2.
+
+---
+
+## Module 2
+
+**Opening Message:**
+Building on our foundation, we will now explore practical frameworks and tools you can apply immediately.
+
+**Key Points:**
+* Evidence-based approaches have been proven across industries
+* Your context matters - adapt frameworks to your situation
+* Implementation requires both skill and persistence
+
+**Discussion Questions:**
+* Which framework resonates most with your current challenges?
+* What barriers might you face in implementing these approaches?
+
+**Transition:**
+With these frameworks in hand, let's look at advanced implementation strategies in Module 3."""
+
+
+def gen_handout(fmt, topic, content):
+    key = os.environ.get('GROQ_API_KEY')
+    keys_to_try = [key] if key else []
+    if groq_key_2:
+        keys_to_try.append(groq_key_2)
+    if groq_key_3:
+        keys_to_try.append(groq_key_3)
+    if groq_key_4:
+        keys_to_try.append(groq_key_4)
+    
+    topic_upper = topic.upper()
+    
+    for api_key in keys_to_try:
+        try:
+            client = Groq(api_key=api_key)
+            resp = client.chat.completions.create(
+                model="llama-3.1-8b-instant",
+                messages=[
+                    {"role": "system", "content": "Create participant handout with module titles and structured learning format."},
+                    {"role": "user", "content": f"""Create participant handout for {topic}.
+
+From content: {content[:3000]}
+
+Format EXACTLY like this for EACH module:
+
+# {topic_upper} - PARTICIPANT GUIDE
+
+---
+
+## MODULE 1: Why Topic Now
+
+**Key Concepts:**
+- Market context: Extract from content or write placeholder
+- Business impact: Extract from content or write placeholder
+- Why now: Extract from content or write placeholder
+
+**Framework Overview:**
+1-2 sentence description of the framework covered
+
+**Your Notes:**
+___________________________________________________________________________
+___________________________________________________________________________
+___________________________________________________________________________
+___________________________________________________________________________
+
+---
+
+## MODULE 2: Title from content
+
+**Key Concepts:**
+- Concept 1 from content
+- Concept 2 from content
+- Concept 3 from content
+
+**Framework Overview:**
+Framework name and brief description
+
+**Your Notes:**
+___________________________________________________________________________
+___________________________________________________________________________
+___________________________________________________________________________
+___________________________________________________________________________
+
+---
+
+Repeat this format for ALL modules found in the content."""}
+                ],
+                temperature=0.3, max_tokens=8000
+            )
+            return resp.choices[0].message.content
+        except:
+            continue
+    
+    # Fallback
+    return f"""# {topic_upper} - PARTICIPANT GUIDE
+
+## MODULE 1: Foundation
+
+**Key Concepts:**
+- Concept 1
+- Concept 2
+- Concept 3
+
+**Your Notes:**
+___________________________________________________________________________
+___________________________________________________________________________
+___________________________________________________________________________
+
+"""
+
+
+def prepare_ppt_text(content, topic):
+    """Prepare PowerPoint export instructions and AI prompt"""
+    if not content or content == "Generate & unlock..." or "LOCKED" in content:
+        return "Please generate and unlock content first!", ""
+    
+    lines = content.split('\n')
+    module_info = []
+    
+    for i, line in enumerate(lines):
+        if '**Generated:**' in line or '**Audience:**' in line or '**Duration:**' in line:
+            continue
+        if line.startswith('# MODULE') or line.startswith('## SESSION'):
+            module_info.append(line.strip())
+        elif '**The ' in line and 'Framework**' in line:
+            module_info.append('  ' + line.strip())
+    
+    ppt_prompt = f"""Create a professional presentation on: {topic}
+
+Structure the presentation to cover these key areas:
+
+{chr(10).join(module_info[:30])}
+
+Please create comprehensive slides that:
+- Start with a compelling title slide
+- Include an overview of why this topic matters now
+- Cover each module/section with clear explanations
+- Use bullet points and visuals for frameworks
+- Add real-world examples and case studies
+- End with implementation steps and key takeaways
+
+Make it executive-ready, visually engaging, and actionable."""
+    
+    instructions = f"""# Ready to Create Your Presentation!
+
+**Topic:** {topic}
+
+---
+
+## Option 1: Download Full Content
+
+**Download the complete training content to create slides manually**
+
+### Steps:
+1. Click **"Download Content"** button below (in Content tab)
+2. Copy sections you want to include in your presentation
+3. Paste into PowerPoint, Google Slides, or Keynote
+4. Format and design slides manually
+
+**Best for:** Full control over design and layout
+
+---
+
+## Option 2: AI-Generated PPT (Recommended)
+
+**Use Gamma AI or GenSpark AI to automatically create your presentation**
+
+### Steps:
+1. **Copy the AI prompt** from the "AI Prompt for Gamma/GenSpark" box below
+2. **Click** "Open Gamma AI" or "Open GenSpark AI" button
+3. **Sign in** with your account credentials
+4. **Paste** the prompt into the AI chat/input field
+5. **Generate** - Let AI create your presentation in minutes!
+
+**Why use AI tools?**
+- Professional design automatically applied
+- Visual layouts and graphics included
+- Faster than manual creation
+- Modern, engaging slide formats
+
+---
+
+
+
+**Choose your preferred option below**
+"""
+    
+    return instructions, ppt_prompt
+
+
+def unlock(sess):
+    """Unlock full access to generated content"""
+    if not sess or sess not in payment_state:
+        return "Generate first", "No content", "No content", "Generate first", "Generate first", ""
+    
+    payment_state[sess]['paid'] = True
+    save_state()
+    
+    # Track unlock
+    track_unlock()
+    
+    ppt_inst, ppt_txt = prepare_ppt_text(
+        payment_state[sess]['content'], 
+        payment_state[sess]['topic']
+    )
+    
+    return (
+        payment_state[sess]['content'],
+        payment_state[sess]['facil'],
+        payment_state[sess]['handout'],
+        "UNLOCKED!",
+        ppt_inst,
+        ppt_txt
+    )
+
+
+def create_prog(topic, fmt, dur, aud_lvl, company_name, company_context, sess, progress=gr.Progress()):
+    """Main function to create training program"""
+    if not topic: 
+        return "Enter topic", "Locked", "Locked", "Locked", "Waiting", gr.update(visible=False), None, "Generate first", ""
+    
+    try:
+        start = time.time()
+        sid = gen_session_id()
+        
+        progress(0.1, desc="Detecting domain & researching...")
+        res = fetch_research(topic)
+        domain = res.get('domain', 'business')
+        
+        progress(0.25, desc=f"Creating {domain} instructions...")
+        syn = gen_synopsis(topic, aud_lvl, fmt, dur, res)
+        
+        progress(0.4, desc=f"Generating {fmt} for {domain}...")
+        
+        if fmt=="Training": 
+            cont, gt, mod, stat = gen_training(topic, aud_lvl, dur, res, aud_lvl, company_name, company_context)
+        elif fmt=="Workshop": 
+            cont, gt, mod, stat = gen_workshop(topic, aud_lvl, dur, res, company_name, company_context)
+        else: 
+            cont, gt, mod, stat = gen_action(topic, aud_lvl, dur, res, company_name, company_context)
+        
+        if stat=="Error": 
+            return syn, "Failed", "Failed", "Failed", "Error", gr.update(visible=False), sid, "Error", ""
+        
+        progress(0.7, desc="Creating facilitator guide...")
+        fac = gen_facil(fmt, topic, cont)
+        
+        progress(0.9, desc="Creating participant handout...")
+        hand = gen_handout(fmt, topic, cont)
+        
+        tot = time.time() - start
+        progress(1.0, desc="Done!")
+        
+        # Track generation
+        track_generation(topic, fmt, aud_lvl)
+        
+        payment_state[sid] = {
+            'content': cont, 
+            'facil': fac, 
+            'handout': hand, 
+            'topic': topic,
+            'format': fmt,
+            'audience': aud_lvl,
+            'duration': dur,
+            'domain': domain,
+            'paid': False
+        }
+        save_state()
+        
+        lock = f"# LOCKED\n\nFull {fmt.lower()} after unlock.\n\nClick Unlock."
+        
+        stat_msg = f"""READY!
+
+Time: {tot:.1f}s
+Topic: {topic}
+Domain: {domain.title()}
+Audience: {aud_lvl}
+Format: {fmt}
+
+Instructions: Ready
+Content: Locked
+Facilitator: Locked
+Handout: Locked
+PPT Export: Locked
+
+Click Unlock!"""
+        
+        return syn, lock, lock, lock, stat_msg, gr.update(visible=True), sid, "Generate and unlock to export to PPT", ""
+    except Exception as e:
+        print(f"Error in create_prog: {e}")
+        import traceback
+        traceback.print_exc()
+        return str(e), "Error", "Error", "Error", "Error", gr.update(visible=False), None, "Error", ""
+
+
+# Load saved state on startup
+print("Loading saved state...")
+load_state()
+load_analytics()
+print(f"Loaded {len(payment_state)} existing sessions")
+print(f"Supported domains: {', '.join(DomainDetector.get_all_domains())}")
+
+# Print analytics on startup
+try:
+    print(get_analytics_summary())
+except Exception as e:
+    print(f"Analytics summary error: {e}")
+    # Load saved state on startup
+print("Loading saved state...")
+load_state()
+load_analytics()
+print(f"Loaded {len(payment_state)} existing sessions")
+print(f"Supported domains: {', '.join(DomainDetector.get_all_domains())}")
+
+# Print analytics on startup
+try:
+    print(get_analytics_summary())
+except Exception as e:
+    print(f"Analytics summary error: {e}")
+
+# Create Gradio interface
+with gr.Blocks(title="NEXUS") as demo:
+    gr.Markdown("""
+<style>
+h1 { font-size: 2.2em !important; font-weight: 800 !important; color: #667eea !important; margin-top: 2em !important; }
+h2 { font-size: 2.2em !important; font-weight: 800 !important; color: #667eea !important; }
+h3 { font-size: 1.5em !important; font-weight: 600 !important; }
+p, li { font-size: 1.1em !important; line-height: 1.6 !important; }
+</style>
+
+# NEXUS Learning Generator 
+**Think Clear. Act Better.**
+
+### Universal Training | Workshop | Action Learning Generator
+
+<div style="background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); padding: 15px; border-radius: 10px; margin: 10px 0;">
+<p style="color: white; margin: 0; font-size: 16px;"><strong>Nexus:</strong> Transforms training development from weeks to minutes - generating research-backed, pedagogically sound training programs complete with facilitator notes, participant handouts, interactive exercises, and curated video content.</p>
+</div>
+
+**Domain-agnostic research, automatic field detection, specialized frameworks for 12+ industries**
+""")
+    
+    sid = gr.State(None)
+    
+    with gr.Row():
+        with gr.Column(scale=2):
+            topic = gr.Textbox(
+                label="Purpose of Training", 
+                placeholder="e.g., Strategic Planning, Ophthalmology for Residents, Car Engine Diagnostics, Python Programming, etc.",
+                info="Works for ANY professional topic - business, medical, technical, or specialized fields"
+            )
+            company_name = gr.Textbox(
+                label="Company Name (Optional)",
+                placeholder="e.g., Tata Steel, Apollo Hospitals, Infosys",
+                info="Company receiving this training - we'll research and customize content"
+            )
+            company_context = gr.Textbox(
+                label="Company Context (Optional)",
+                placeholder="e.g., Manufacturing company with 500 employees facing digital transformation, or Healthcare provider expanding to 3 new cities",
+                lines=2,
+                info="Provide company details to customize the training content"
+            )
+            aud_lvl = gr.Radio(
+                label="Audience Level",
+                choices=["Executive/C-Suite/Senior Leadership", "Manager/Supervisor/Team Lead", "Emerging/New/First-Time Leader", "Individual Contributor/Specialist"],
+                value="Executive/C-Suite/Senior Leadership"
+            )
+            with gr.Row():
+                fmt = gr.Radio(label="Format", choices=["Training", "Workshop", "Action Learning"], value="Training")
+                dur = gr.Radio(label="Duration", choices=["1 Day (6-7 hours)", "2 Days (12-14 hours)"], value="1 Day (6-7 hours)")
+            btn_gen = gr.Button("Generate", variant="primary", size="lg")
+        
+        with gr.Column(scale=1):
+            status = gr.Textbox(
+                label="Status", 
+                lines=15, 
+                interactive=False, 
+                value="""Ready! 
+
+
+Universal Domain Support:
+- Business & Leadership
+- Medical & Healthcare
+- Engineering & Technical
+- IT & Software
+- Finance & Accounting
+- Legal & Compliance
+- Education & Training
+- Manufacturing & Operations
+- Sales & Marketing
+- Hospitality & Service
+- Travel & Tourism
+- Construction & Trades
+- Any professional topic!
+
+Formats:
+- Training (3-5 modules)
+- Workshop (4-8 sessions)
+- Action Learning (6-12 wks)
+
+Enter topic & Generate!"""
+            )
+            btn_unlock = gr.Button("Unlock Full Access", variant="secondary", size="lg", visible=False)
+    
+    # Fix for the indentation error in the Gradio interface section
+# Replace the tabs section (starting from line ~2470) with this corrected version:
+
+    # CRITICAL FIX: Only the indentation in the tabs section needs correction
+# Replace lines 2445-2700 in your original code with this:
+
+   # Replace the entire tabs section in your Gradio interface with this complete version
+# This includes ALL features: videos, templates, elaborate framework steps
+
+    # Complete Gradio Tabs Section - Replace your entire tabs section with this
+
+    with gr.Tabs():
+        with gr.Tab("Instructions"):
+            syn_out = gr.Markdown("""# How to Use NEXUS
+
+## 📋 Quick Start Guide
+
+### Step 1: Enter Your Topic
+Enter any professional topic in the "Purpose of Training" field above.
+
+Examples:
+- Strategic Planning
+- Ophthalmology for Residents  
+- Car Engine Diagnostics
+- Python Programming
+- Leadership Development
+- Any professional topic!
+
+### Step 2: Add Company Details (Optional)
+- **Company Name**: Enter the company receiving this training
+- **Company Context**: Add specific details about their situation
+
+This will customize all content specifically for that company with:
+- Industry-specific market trends
+- Company-relevant metrics and examples
+- Tailored challenges and opportunities
+
+### Step 3: Select Settings
+- **Audience Level**: Choose the leadership/skill level
+- **Format**: Training (modules), Workshop (sessions), or Action Learning (weeks)
+- **Duration**: 1 Day (3 modules/4 sessions) or 2 Days (5 modules/8 sessions)
+
+### Step 4: Generate & Review
+1. Click **"Generate"** button
+2. Wait 30-60 seconds while NEXUS creates your content
+3. Review this tab - it will update with detailed instructions
+4. Click **"Unlock Full Access"** to view all materials
+
+---
+
+## 📦 What You'll Get
+
+✅ Complete training content with frameworks and examples  
+✅ Facilitator guide with talking points  
+✅ Participant handout with note-taking space  
+✅ PowerPoint export ready for AI generation  
+
+---
+
+**Check the "Sample" tab to see complete example output!**
+
+**Ready? Fill in your topic above and click Generate!**
+""")
+        
+        with gr.Tab("Content"):
+            cont_out = gr.Markdown("Generate & unlock to view full content...")
+        
+        with gr.Tab("Facilitator"):
+            fac_out = gr.Markdown("Generate & unlock to view facilitator guide...")
+        
+        with gr.Tab("Handout"):
+            hand_out = gr.Markdown("Generate & unlock to view participant handout...")
+        
+        with gr.Tab("PPT Export"):
+            ppt_instructions = gr.Markdown("Generate and unlock content first to export to PPT")
+            ppt_text = gr.Textbox(
+                label="AI Prompt for Gamma/GenSpark",
+                lines=20,
+                placeholder="Your AI prompt will appear here after unlocking...",
+                interactive=True
+            )
+            with gr.Row():
+                gr.HTML('<a href="https://gamma.app" target="_blank" style="display: inline-block; padding: 10px 20px; background-color: #667eea; color: white; text-decoration: none; border-radius: 5px; font-weight: bold; margin: 5px;">Open Gamma AI</a>')
+                gr.HTML('<a href="https://www.genspark.ai" target="_blank" style="display: inline-block; padding: 10px 20px; background-color: #667eea; color: white; text-decoration: none; border-radius: 5px; font-weight: bold; margin: 5px;">Open GenSpark AI</a>')
+            gr.Markdown("""
+### How to Use:
+1. **Copy the prompt** from the text box above
+2. **Click** one of the blue buttons to open Gamma AI or GenSpark AI
+3. **Paste** the prompt and generate your presentation
+4. **Download** your professional PPT in minutes!
+""")
+        
+        with gr.Tab("Sample"):
+            gr.Markdown("""# Sample Output - Strategic Planning Training
+
+## Why Strategic Planning Matters Now
+
+**Market Context & Trends:**
+* 85% of organizations lack an effective strategic planning process (Source: Harvard Business Review)
+* Companies with formal strategic planning are 12% more profitable (Source: McKinsey & Company)
+* Only 23% of organizations successfully execute their strategy (Source: BCG)
+* Strategic planning market growing at 11% annually, reaching $8.2B by 2028 (Source: MarketsandMarkets)
+* 76% of executives view strategic planning as critical for competitive advantage (Source: Deloitte)
+
+**Business Impact:**
+* Organizations with effective planning see 30% higher productivity (Source: Bain & Company)
+* 67% of high-performing companies attribute success to strategic clarity (Source: McKinsey)
+* Companies with strategic alignment report 2.5x higher revenue growth (Source: MIT Sloan)
+* Strategic planning reduces resource waste by 40% (Source: Harvard Business Review)
+
+**Why Now:**
+* Market volatility requires adaptive strategic approaches (Source: BCG)
+* Digital transformation demands integrated strategic frameworks (Source: Gartner)
+* Remote work necessitates new planning methodologies (Source: McKinsey)
+* Economic uncertainty creates strategic planning urgency (Source: Harvard Business Review)
+
+---
+
+## Context & Challenge
+
+**Context:**
+Organizations are facing unprecedented market volatility and competitive pressure requiring faster, more adaptive strategic responses.
+
+**Challenge:**
+How do you create a strategic plan that's both visionary and executable when the future seems increasingly unpredictable?
+
+**The Landscape Has Changed:**
+In the past 24 months, strategic planning cycles have shortened from annual to quarterly in 60% of organizations, and agile strategy frameworks have become the new standard.
+
+**The Cost of Standing Still:**
+* Organizations without clear strategy lose 25% efficiency annually
+* Competitors with adaptive strategies capture market share at 3x rate
+* Strategic drift costs Fortune 500 companies average $50M per year
+
+**The Opportunity:**
+When you master strategic planning, you create organizational alignment, faster decision-making, and sustainable competitive advantage.
+
+---
+
+## MODULE 1: Foundation of Strategic Thinking
+
+**Duration:** 90 min
+
+### What You Will Walk Away With
+
+By the end of this module:
+
+1. **Apply** the Strategic Canvas framework to map your competitive position
+2. **Create** a compelling strategic vision that drives action
+3. **Build** strategic priorities using the Impact-Effort matrix
+
+NOT theory. NOT concepts. ACTIONS to take Monday morning.
+
+---
+
+### Patterns We See
+
+**Common Patterns:**
+1. Creating 50-page strategic plans that nobody reads or implements
+2. Setting vague goals like "increase market share" without clear metrics
+3. Planning in isolation without stakeholder input or buy-in
+
+**Myths vs Reality:**
+* **Myth:** Strategic planning is only for executives
+  **Reality:** The best strategies involve input from all organizational levels, as front-line employees often see market shifts first
+
+* **Myth:** Strategy must be kept confidential
+  **Reality:** Organizations that share strategy broadly execute 40% faster (McKinsey)
+
+**The Hidden Cost:**
+Without effective strategic planning, organizations waste approximately 30% of leadership time on misaligned initiatives, equivalent to $250K+ annually in a 50-person company.
+
+---
+
+### The Core Frameworks
+
+#### Framework 1: Strategic Canvas (Blue Ocean Strategy)
+
+**What It Is (In Plain Language):**
+A visual tool that maps how your organization competes compared to others, helping you find unique positioning and avoid head-to-head competition.
+
+**Why It Works:**
+Instead of competing on the same factors as everyone else, you identify what to eliminate, reduce, raise, and create to differentiate.
+
+**When To Use It:**
+* Starting a new strategic planning cycle
+* Facing increased competitive pressure
+* Looking to reposition your organization
+* Entering new markets
+
+**When NOT To Use It:**
+* When you need to defend current position rather than create new space
+* In highly regulated industries with limited differentiation options
+
+**The Framework in Action:**
+
+CRITICAL: This section shows DETAILED step-by-step implementation with multiple actions per step.
+
+**Step 1: MAP - Identify Key Competition Factors**
+
+You begin by listing 8-12 factors that truly define how companies compete in your industry. This isn't about what you think matters—it's about what customers actually care about and what competitors emphasize. You're looking for the complete picture of the competitive landscape.
+
+- **Action:** Survey 10-15 customers asking "What factors do you consider when choosing a provider in our industry?"
+- **Action:** Visit 3-5 competitor websites and note what they emphasize in their marketing
+- **Action:** List out every factor, even if it seems obvious (price, speed, expertise, relationship, results, etc.)
+- **Example:** For a consulting firm, factors might include: price per hour, years of experience, industry specialization, response time, methodology/tools, relationship quality, results guarantee, geographic reach
+- **Common Mistake:** Listing only factors where you're strong, rather than all factors that define the industry
+- **Pro Tip:** Ask front-line sales teams what objections they hear most—those reveal the real competitive factors
+
+**Step 2: PLOT - Chart Current Position**
+
+Now you rate yourself and 2-3 key competitors on each factor using a 1-10 scale. This creates visual lines on a graph that show where everyone is positioned. The goal is to see clustering—where everyone competes the same way.
+
+- **Action:** Rate your organization on each factor (1=low, 10=high) and plot on a graph
+- **Action:** Do the same for your top 3 competitors based on market perception
+- **Action:** Draw lines connecting the dots for each organization
+- **Example:** If all consultants cluster around "high expertise (8-9), high price (8-9), slow delivery (3-4)"—that's red ocean competition
+- **Common Mistake:** Rating based on internal beliefs rather than customer perception
+- **Pro Tip:** Have customers rate you and competitors—their perception is your reality
+
+**Step 3: ELIMINATE-REDUCE-RAISE-CREATE (ERRC Grid)**
+
+This is where strategy happens. Question every factor through four lenses: What can you eliminate completely? What should you reduce? What should you raise? What should you create that's never existed? You're redesigning the rules of competition.
+
+- **Action:** For ELIMINATE—Which factors does the industry take for granted that you could remove completely? (Example: Fancy offices, lengthy proposals)
+- **Action:** For REDUCE—Which factors should you reduce well below industry standard? (Example: Meeting frequency, formality)
+- **Action:** For RAISE—Which factors should you raise well above industry standard? (Example: Results transparency, speed)
+- **Action:** For CREATE—What should you create that's never been offered? (Example: Success-based pricing, real-time dashboards)
+- **Example:** Consulting firm eliminates expensive offices, reduces meeting cadence from weekly to bi-weekly, raises results transparency with live dashboards, creates 100% success-based pricing
+- **Common Mistake:** Only tweaking existing factors rather than truly eliminating or creating
+- **Pro Tip:** The most powerful moves are in ELIMINATE and CREATE—that's where differentiation lives
+
+**Step 4: DRAW - Design Your New Strategic Canvas**
+
+Finally, you sketch your new competitive curve showing your repositioned organization. This curve should look distinctly different from competitors—not just better on the same factors, but different in shape entirely.
+
+- **Action:** Sketch what your new curve looks like—which factors are now 0, which are 10, which are 5
+- **Action:** Compare to competitor curves—yours should have a unique shape, not just higher/lower
+- **Action:** Write a one-sentence positioning statement: "We are the only [category] that [unique combination]"
+- **Example:** "We are the only management consultancy that charges nothing upfront and gets paid only when results are achieved"
+- **Common Mistake:** Creating a curve that's just slightly different—bold differentiation requires obvious visual difference
+- **Pro Tip:** If your curve looks like everyone else's but "better"—you're still in red ocean
+
+**How Long This Takes:**
+2-3 facilitated sessions (3 hours each) over two weeks
+
+**What Success Looks Like:**
+You have a visual canvas showing a unique competitive position, a positioning statement that makes competitors' approach seem outdated, and buy-in from leadership on which factors to eliminate/reduce/raise/create.
+
+---
+
+### See It in Action: Real Example
+
+**Company:** Cirque du Soleil
+**Industry:** Entertainment
+**Challenge:** The circus industry was in decline with rising costs (animals, star performers, multiple venues), growing concerns about animal welfare, and intense competition from other entertainment options like movies, sports, and theme parks. Traditional circuses were stuck competing on the same factors—bigger animals, more famous performers, lower prices.
+
+**What They Did:**
+
+Step 1: They mapped the circus industry's competition factors: star performers, animal acts, thrill/danger, humor, multiple shows simultaneously, venue quality, ticket price, artistic music/dance, theme/story.
+
+Step 2: They charted Ringling Bros, smaller regional circuses, and other entertainment options—all clustered around similar factors.
+
+Step 3: Applied ERRC Grid:
+- **ELIMINATED:** Animal acts (cost, ethics), star performers (egos, cost), multiple venue shows (complexity)
+- **REDUCED:** Humor and slapstick, thrill/danger elements
+- **RAISED:** Unique venues (custom-built theaters), artistic quality of music and dance
+- **CREATED:** Theatrical themes and storylines, refined environment for adults, artistic production value
+
+Step 4: Created "Cirque du Soleil" category—not a circus, not theater, not ballet—something entirely new.
+
+**What Changed:**
+* Created an entirely new "artistic circus" market category with no direct competition
+* Achieved 22x revenue growth in just 10 years
+* Commanded premium pricing 10x higher than traditional circuses
+* Attracted adult audience who would never attend a traditional circus
+* Eliminated 70% of traditional circus costs while raising revenues dramatically
+
+**The Key Insight:**
+Competing to be the "best circus" meant fighting over a shrinking pie in a declining industry. Creating a new category—sophisticated artistic entertainment that happens to involve circus skills—meant owning a blue ocean with no competition. They stopped fighting Ringling Bros and started attracting theater and Vegas show audiences instead.
+
+---
+
+### Your Turn: Practice Exercise
+
+**What You Will Create:** Your organization's Strategic Canvas showing current position vs. 2 competitors, plus your future differentiated position
+
+**Why This Matters:** This exercise forces you to confront whether you're truly differentiated or just "better" at the same things as competitors. Most leaders discover they're in red ocean competition and need bold repositioning.
+
+**Instructions (35 min):**
+
+**Individual Work (15 min):**
+1. List 8-10 competition factors in your industry (what customers consider when choosing)
+2. Rate yourself and 2 competitors on each factor (1-10 scale) and plot on simple graph
+3. Apply ERRC Grid: What will you eliminate, reduce, raise, create? Be bold—safe answers don't differentiate
+
+**Small Group Discussion (10 min):**
+- Share your current canvas—do you cluster with competitors?
+- Share your ERRC decisions—are they bold enough to create visual differentiation?
+- Give feedback: "Your eliminate/create decisions need to be bolder" or "That's differentiated but might alienate core customers"
+
+**Refinement (10 min):**
+- Revise your ERRC Grid based on feedback—push yourself to be bolder
+- Draw your new strategic curve—it should look distinctly different in shape
+- Write your positioning statement: "We are the only _____ that _____"
+
+**Tools Provided:**
+- Search "Strategic Canvas Template" on Google - blank graph for mapping competition factors
+- Search "ERRC Grid Worksheet" on Google - four-quadrant template for eliminate/reduce/raise/create
+- Search "Positioning Statement Template" on Google - fill-in format for unique positioning
+
+**Find Templates Online:**
+- Google Search: "strategic canvas template blue ocean"
+- Google Search: "ERRC grid worksheet blue ocean strategy"
+- Google Search: "blue ocean strategy positioning statement template"
+
+---
+
+### Resources to Go Deeper
+
+**Video 1: Blue Ocean Strategy Explained with Examples** (Under 3 min)
+- YouTube search: "blue ocean strategy explained 3 minutes"
+- Recommended channels: Harvard Business Review, Blue Ocean Strategy Official, TED-Ed
+- What you'll learn: Quick overview of blue ocean vs red ocean with visual examples of companies who succeeded
+
+**Video 2: Cirque du Soleil Blue Ocean Case Study** (Under 3 min)
+- YouTube search: "cirque du soleil blue ocean strategy case study"
+- Recommended channels: Case Study Channel, Business Strategy Hub, Strategy Simplified
+- What you'll learn: Detailed breakdown of how Cirque applied ERRC grid to transform the circus industry
+
+**Video 3: Common Strategic Canvas Mistakes to Avoid** (Under 3 min)
+- YouTube search: "strategic canvas mistakes to avoid"
+- Recommended channels: Strategy experts, business school channels, consulting firms
+- What you'll learn: Why most strategic canvases fail to differentiate and how to create bold positioning
+
+---
+
+### Group Dialogue
+
+**Opening Question (10 min):**
+Think about a time when you competed head-to-head with others on the same factors. What did that competition feel like? What was the cost of competing that way?
+
+**Closing Question (10 min):**
+Looking at your Strategic Canvas, what's the ONE factor you could eliminate or create that would make your competitors' approach seem outdated? What's stopping you?
+
+---
+
+### One Bold Closing Thought
+
+**Most strategies fail because they try to be "better" rather than "different." Better means endless competition. Different means you're playing a game only you can win.**
+
+**Next Step:**
+In the next 48 hours, interview 3 customers and ask: "If we eliminated [factor from your ERRC], would you still buy from us?" Their answer tells you if you're ready for blue ocean.
+
+---
+
+*[Modules 2-3 would follow this same comprehensive structure with elaborate frameworks, templates, and video resources]*
+
+---
+
+## 30-Day Implementation Plan
+
+**Week 1: Foundation & Assessment**
+- Day 1-2: Complete Strategic Canvas with leadership team
+- Day 3-4: Validate ERRC decisions with customer interviews
+- Day 5: Finalize positioning statement and communication
+
+**Week 2: Vision & Priorities**
+- Day 8-10: Develop strategic vision and communication cascade
+- Day 11-12: Define strategic priorities using Impact-Effort matrix
+- Day 14: Present to organization and gather feedback
+
+**Week 3: Initiative Design**
+- Day 15-17: Create strategic initiatives with clear owners and metrics
+- Day 18-19: Develop resource allocation plan and budget
+- Day 21: Conduct initiative review and alignment session
+
+**Week 4: Launch & Execution**
+- Day 22-24: Launch communication plan across organization
+- Day 25-26: Begin execution of first-wave initiatives
+- Day 28-30: Establish monitoring cadence and success metrics tracking
+
+---
+
+## Success Metrics
+
+**90-Day Outcomes:**
+* Leadership alignment score increases from baseline to 85%+
+* 75% of employees can articulate strategy in one sentence
+* Strategic decision-making speed improves by 40%
+
+**6-Month Outcomes:**
+* 80% of strategic priorities on track or completed
+* Measurable impact on revenue/profit (5-10% improvement)
+* Market position shift reflected in customer perception surveys
+* Employee engagement with strategy at 80%+
+
+---
+
+*This is an abbreviated sample showing the complete structure you'll receive. Your generated training will include ALL modules with this level of detail, including elaborate framework steps, template search prompts, and curated video resources under 3 minutes.*
+""")
+        
+        with gr.Tab("About Creator"):
+            gr.Markdown("""# About the Creator
+
+## Your Professional Thought Partner
+
+**Ashish Mehra** is an ICF Level 2 certified transformational coach and leadership trainer with 1,000+ hours of coaching experience, working with CEOs and senior leaders across India, Canada, Singapore, and Africa. He blends deep coaching expertise with hands-on leadership experience from global organisations to drive measurable change in mindset, performance, and business impact.
+
+---
+
+## Credentials & Experience
+
+- **INSEAD Alumnus**
+- **ICF Level 2 Certified Coach**
+- **3 decades of experience** working in blue-chip companies:
+  - Xerox
+  - Airtel
+  - Singtel
+  - Hitachi
+- **Trained by Centre for Creative Leadership**
+
+---
+
+## Why NEXUS?
+
+I created NEXUS to solve a problem I faced repeatedly: **spending long hours creating and preparing bespoke training content.**
+
+After 5 years of manually creating training programs, I realized:
+
+- Traditional design takes 40-80 hours per program
+- Research is scattered across multiple sources
+- Frameworks aren't adapted for different audiences
+- Quality varies based on designer availability
+
+**NEXUS combines:**
+
+- My expertise in understanding behaviours and leadership
+- Research from top institutions (HBR, McKinsey, Stanford)
+- AI-powered content generation
+- Proven pedagogical frameworks
+
+---
+
+## My Approach
+
+My methodology blends deep inner clarity with sharp business relevance—helping leaders align who they are with how they lead. I work at the intersection of mindset, behaviour, and strategy, using powerful inquiry and real-world experiments to create shifts that are both human and measurable.
+
+---
+
+## Connect With Me
+
+**Email:** ashish.mehra@interfaceinc.co.in
+
+**LinkedIn:** [linkedin.com/in/asmehra](https://www.linkedin.com/in/asmehra)
+
+**Website:** [interfaceinc.co.in](https://interfaceinc.co.in/)
+
+---
+
+*NEXUS represents the convergence of deep human insight and cutting-edge technology—transforming how we develop leaders and build high-performing organizations.*
+""")
+    
+    # Wire up the buttons
+    btn_gen.click(
+        create_prog,
+        [topic, fmt, dur, aud_lvl, company_name, company_context, sid],
+        [syn_out, cont_out, fac_out, hand_out, status, btn_unlock, sid, ppt_instructions, ppt_text]
+    )
+    
+    btn_unlock.click(
+        unlock,
+        [sid],
+        [cont_out, fac_out, hand_out, status, ppt_instructions, ppt_text]
+    )
+# Launch the application
+if __name__ == "__main__":
+    print("=" * 60)
+    print("NEXUS Learning Generator - Universal Domain Support")
+    print("Starting Gradio interface...")
+    print("=" * 60)
+    
+    try:
+        demo.queue()
+        demo.launch(
+            server_name="0.0.0.0",
+            server_port=7860,
+            show_error=True,
+            share=False,
+            debug=True
+        )
+        print("NEXUS is running successfully!")
+    except Exception as e:
+        print(f"Launch error: {e}")
+        import traceback
+        traceback.print_exc()
+        raise
