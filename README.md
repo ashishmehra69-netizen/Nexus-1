@@ -1,5 +1,4 @@
 title: Nexus1
-emoji: 🐨
 colorFrom: yellow
 colorTo: blue
 sdk: gradio
